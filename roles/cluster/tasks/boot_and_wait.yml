@@ -69,13 +69,12 @@
     cluster_bootstrap_safe: false
 
 - name: "[UPI] Monitor bootstrap progress (up to 150 min)"
-  when: not _cluster_is_sno
   ansible.builtin.include_tasks: monitor_bootstrap_tick.yml
   loop: "{{ range(30) | list }}"
   loop_control:
     loop_var: _tick
     label: "tick {{ _tick }}"
-  when: not cluster_bootstrap_safe
+  when: not _cluster_is_sno and not cluster_bootstrap_safe
 
 - name: "[UPI] Bootstrap timed out"
   when:
@@ -182,13 +181,12 @@
     cluster_install_complete: false
 
 - name: "[UPI] Monitor install completion (up to 40 min)"
-  when: not _cluster_is_sno
   ansible.builtin.include_tasks: monitor_install_tick.yml
   loop: "{{ range(8) | list }}"
   loop_control:
     loop_var: _tick
     label: "tick {{ _tick }}"
-  when: not cluster_install_complete
+  when: not _cluster_is_sno and not cluster_install_complete
 
 - name: "[UPI] Final CSR approval"
   when: not _cluster_is_sno

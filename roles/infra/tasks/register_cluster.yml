@@ -6,6 +6,31 @@
 - name: Add infra VM to inventory
   ansible.builtin.include_tasks: add_to_inventory.yml
 
+# Read the persisted cluster_bridge from the infra VM.
+# ensure_cluster_bridge.yml (run by make infra) writes the chosen bridge name
+# to /etc/infra/cluster_bridge. We read it here so make install knows which
+# bridge to attach cluster VMs to without needing cluster_bridge in proxmox.yml.
+- name: Read persisted cluster_bridge from infra VM
+  ansible.builtin.slurp:
+    src: /etc/infra/cluster_bridge
+  delegate_to: infra_host
+  register: _register_bridge_file
+  failed_when: false
+
+- name: Set cluster_bridge from persisted value
+  ansible.builtin.set_fact:
+    cluster_bridge: "{{ _register_bridge_file.content | b64decode | trim }}"
+  when:
+    - _register_bridge_file.content is defined
+    - (_register_bridge_file.content | b64decode | trim) | length > 0
+
+- name: Fail if cluster_bridge could not be determined
+  ansible.builtin.assert:
+    that: cluster_bridge | length > 0
+    fail_msg: >-
+      cluster_bridge is not set and could not be read from /etc/infra/cluster_bridge
+      on the infra VM. Run 'make infra' first to create the isolated cluster bridge.
+
 - name: Verify infra VM is reachable
   ansible.builtin.wait_for:
     host: "{{ infra_ip }}"
