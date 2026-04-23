@@ -1,0 +1,44 @@
+---
+# Configure eth1 (cluster bridge NIC) with a static IP.
+# This NIC connects the infra VM to the isolated vmbr1 bridge
+# where all cluster VMs live.
+
+- name: Check if cluster bridge NIC (eth1) already has the correct IP
+  ansible.builtin.command:
+    cmd: "ip addr show eth1"
+  delegate_to: infra_host
+  register: _nic_eth1_check
+  changed_when: false
+  failed_when: false
+
+- name: Configure eth1 with static IP {{ infra_cluster_ip }}/16 via NetworkManager
+  ansible.builtin.command:
+    cmd: >-
+      nmcli connection add type ethernet ifname eth1 con-name cluster-bridge
+      ipv4.method manual ipv4.addresses {{ infra_cluster_ip }}/16
+      ipv4.never-default yes connection.autoconnect yes
+  delegate_to: infra_host
+  when: infra_cluster_ip not in _nic_eth1_check.stdout
+  register: _nic_add_result
+  failed_when: _nic_add_result.rc != 0 and 'already exists' not in (_nic_add_result.stderr | default(''))
+  changed_when: _nic_add_result.rc == 0
+
+- name: Bring up cluster bridge NIC connection
+  ansible.builtin.command:
+    cmd: nmcli connection up cluster-bridge
+  delegate_to: infra_host
+  when: infra_cluster_ip not in _nic_eth1_check.stdout
+  changed_when: true
+  failed_when: false
+
+- name: Verify eth1 has correct IP
+  ansible.builtin.command:
+    cmd: "ip addr show eth1"
+  delegate_to: infra_host
+  register: _nic_eth1_verify
+  changed_when: false
+
+- name: Fail if cluster bridge NIC is not configured
+  ansible.builtin.assert:
+    that: infra_cluster_ip in _nic_eth1_verify.stdout
+    fail_msg: "eth1 does not have IP {{ infra_cluster_ip }}. Check that vmbr1 bridge exists on Proxmox and net1 is added to the infra VM."

@@ -1,0 +1,96 @@
+---
+- name: Stop OpenShift cluster VMs (graceful shutdown)
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  vars:
+    stop_registry: "{{ lookup('env', 'STOP_REGISTRY') | default('false', true) | bool }}"
+
+  tasks:
+    - name: Build VM lists
+      ansible.builtin.set_fact:
+        _stop_worker_vmids: "{{ range(worker_vmid_start | int, worker_vmid_start | int + worker_count | int) | list }}"
+        _stop_master_vmids: "{{ range(master_vmid_start | int, master_vmid_start | int + master_count | int) | list }}"
+
+    - name: Stop worker VMs
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item }}"
+        state: stopped
+        force: false
+        timeout: 120
+      loop: "{{ _stop_worker_vmids }}"
+      loop_control:
+        label: "worker VMID {{ item }}"
+      failed_when: false
+
+    - name: Stop master VMs
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item }}"
+        state: stopped
+        force: false
+        timeout: 120
+      loop: "{{ _stop_master_vmids }}"
+      loop_control:
+        label: "master VMID {{ item }}"
+      failed_when: false
+
+    - name: Stop bootstrap VM (if present)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ bootstrap_vmid }}"
+        state: stopped
+        force: false
+        timeout: 60
+      failed_when: false
+
+    - name: Stop helper VM
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ helper_vmid }}"
+        state: stopped
+        force: false
+        timeout: 60
+      failed_when: false
+
+    - name: Stop registry VM
+      when: stop_registry and registry_enabled | default(false) | bool
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ registry_vmid }}"
+        state: stopped
+        force: false
+        timeout: 60
+      failed_when: false
+
+    - name: Cluster stopped
+      ansible.builtin.debug:
+        msg: |-
+          Cluster VMs shut down:
+            Workers:   {{ _stop_worker_vmids | join(', ') }}
+            Masters:   {{ _stop_master_vmids | join(', ') }}
+            Helper:    {{ helper_vmid }}
+            Registry:  {{ 'stopped' if stop_registry and registry_enabled | default(false) | bool else 'kept running' }}

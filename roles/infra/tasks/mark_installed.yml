@@ -1,0 +1,63 @@
+---
+# Called after bootstrap completes.
+# Sets installing: false for the cluster in clusters.json, then
+# reloads HAProxy to remove bootstrap from API and MCS backends.
+
+- name: Add infra VM to inventory
+  ansible.builtin.include_tasks: add_to_inventory.yml
+
+- name: Read clusters.json
+  ansible.builtin.slurp:
+    src: /etc/infra/clusters.json
+  delegate_to: infra_host
+  register: _mark_clusters_raw
+
+- name: Parse clusters.json
+  ansible.builtin.set_fact:
+    _mark_clusters: "{{ _mark_clusters_raw.content | b64decode | from_json }}"
+
+- name: Fail if cluster is not registered
+  ansible.builtin.assert:
+    that: cluster_name in _mark_clusters
+    fail_msg: "Cluster '{{ cluster_name }}' is not registered in clusters.json on the infra VM."
+
+- name: Set installing to false for cluster
+  ansible.builtin.set_fact:
+    _mark_updated: >-
+      {{ _mark_clusters | combine({
+           cluster_name: _mark_clusters[cluster_name] | combine({'installing': false})
+         }) }}
+
+- name: Write updated clusters.json
+  ansible.builtin.copy:
+    content: "{{ _mark_updated | to_nice_json }}\n"
+    dest: /etc/infra/clusters.json
+    owner: root
+    group: root
+    mode: '0644'
+  delegate_to: infra_host
+
+- name: Regenerate HAProxy config (removes bootstrap from API and MCS backends)
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: '0644'
+    validate: haproxy -c -f %s
+  vars:
+    clusters: "{{ _mark_updated }}"
+  delegate_to: infra_host
+
+- name: Reload HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    state: reloaded
+  delegate_to: infra_host
+
+- name: Cluster marked as installed
+  ansible.builtin.debug:
+    msg:
+      - "Cluster '{{ cluster_name }}' marked as installed"
+      - "  Bootstrap removed from HAProxy API and MCS backends"
+      - "  HAProxy now routes only to master nodes"

@@ -1,0 +1,64 @@
+---
+- name: Detach and destroy a ZFS zvol from worker VMs
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  vars:
+    zvol_name: ""
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - zvol_name | length > 0
+          - zvol_pool is defined
+        fail_msg: "Provide zvol_name (e.g. make zvol-remove VOLUME_NAME=shared-vol-0)"
+
+    - name: Build worker VMID list
+      ansible.builtin.set_fact:
+        worker_vmids: "{{ range(worker_vmid_start | int, worker_vmid_start | int + worker_count | int) | list }}"
+
+    - name: Check zvol exists
+      ansible.builtin.command:
+        cmd: "zfs list {{ zvol_pool }}/{{ zvol_name }}"
+      delegate_to: proxmox_host
+      register: zvol_check
+      failed_when: false
+      changed_when: false
+
+    - name: Fail if zvol does not exist
+      ansible.builtin.fail:
+        msg: "Zvol {{ zvol_pool }}/{{ zvol_name }} does not exist."
+      when: zvol_check.rc != 0
+
+    - name: Find and detach zvol from each worker VM
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          SLOT=$(qm config {{ item }} 2>/dev/null \
+          | grep -E "^scsi[0-9]+:" | grep "{{ zvol_pool }}/{{ zvol_name }}" | cut -d: -f1)
+          if [ -n "$SLOT" ]; then
+            qm set {{ item }} --delete "$SLOT"
+            echo "Detached $SLOT from VM {{ item }}"
+          else
+            echo "Not attached to VM {{ item }}"
+          fi
+        executable: /bin/bash
+      loop: "{{ worker_vmids }}"
+      loop_control:
+        label: "VMID {{ item }}"
+      delegate_to: proxmox_host
+      register: detach_results
+      changed_when: "'Detached' in detach_results.stdout"
+
+    - name: Destroy ZFS zvol
+      ansible.builtin.command:
+        cmd: "zfs destroy {{ zvol_pool }}/{{ zvol_name }}"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Removal complete
+      ansible.builtin.debug:
+        msg: "Zvol {{ zvol_pool }}/{{ zvol_name }} detached and destroyed."

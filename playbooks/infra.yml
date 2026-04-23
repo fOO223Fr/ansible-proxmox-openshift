@@ -1,0 +1,9 @@
+---
+- name: Create and configure shared infra VM
+  hosts: localhost
+  gather_facts: true
+
+  tasks:
+    - name: Create and configure infra VM
+      ansible.builtin.include_role:
+        name: infra

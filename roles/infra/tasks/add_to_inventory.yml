@@ -1,0 +1,12 @@
+---
+# Add the infra VM to the in-memory inventory.
+# Safe to call multiple times — add_host is idempotent in effect.
+- name: Add infra VM to in-memory inventory
+  ansible.builtin.add_host:
+    name: infra_host
+    ansible_host: "{{ infra_ip }}"
+    ansible_user: rocky
+    ansible_ssh_private_key_file: "{{ proxmox_ssh_key }}"
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=60 -o ServerAliveCountMax=120"
+    ansible_become: true
+    groups: infra

@@ -1,0 +1,91 @@
+---
+# Fix for OCP 4.21+ openshift-apiserver PreconditionNotReady deadlock.
+#
+# Root cause: on a fresh install the openshift-apiserver-operator creates a
+# deployment that mounts configmap "audit-0" (the previous-revision audit
+# policy). Revision 0 never existed, so the pod gets FailedMount and the
+# operator records:  revision-status-1.data.reason = 'configmap "audit-0" not found'
+#
+# The ConnectivityCheckController then checks reason != "" and blocks
+# indefinitely — even though revision-ready=true is already set — preventing
+# openshift-apiserver from creating its APIServices.  Without those APIServices
+# the Routes API is unavailable, blocking authentication, monitoring, and console
+# in a circular dependency that the CVO cannot resolve on its own.
+#
+# Workaround (idempotent):
+#   1. Create audit-0 as a copy of audit-1 (satisfies the volume mount)
+#   2. Clear revision-status-1.data.reason (unblocks ConnectivityCheckController)
+#
+# This fix is called once during the bootstrap monitoring loop, as soon as the
+# cluster API responds. Tracked as a known OCP 4.21.0 issue in library-go's
+# revision controller (no upstream JIRA ticket confirmed at time of writing).
+
+- name: Check if audit-0 configmap exists
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+      get configmap audit-0 -n openshift-apiserver
+  register: _fix_audit0_exists
+  failed_when: false
+  changed_when: false
+
+- name: Check if revision-status-1 has a non-empty reason
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+      get configmap revision-status-1 -n openshift-apiserver
+      -o jsonpath='{.data.reason}'
+  register: _fix_revision_reason
+  failed_when: false
+  changed_when: false
+
+- name: Apply openshift-apiserver revision fix
+  when: _fix_audit0_exists.rc != 0 or (_fix_revision_reason.stdout | length) > 0
+  block:
+    - name: "[fix] Get audit-1 content to use as audit-0 baseline"
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          get configmap audit-1 -n openshift-apiserver -o json
+      register: _fix_audit1_json
+      changed_when: false
+      failed_when: false
+
+    - name: "[fix] Create audit-0 configmap (satisfies deployment volume mount)"
+      when:
+        - _fix_audit0_exists.rc != 0
+        - _fix_audit1_json.rc == 0
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          echo '{{ _fix_audit1_json.stdout | replace("'", "'\"'\"'") }}' | \
+            python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          d['metadata']['name'] = 'audit-0'
+          for k in ['resourceVersion','uid','creationTimestamp','managedFields','generation','annotations']:
+              d['metadata'].pop(k, None)
+          print(json.dumps(d))
+          " | {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig apply -f -
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false
+      register: _fix_audit0_create
+
+    - name: "[fix] Clear revision-status-1 reason (unblocks ConnectivityCheckController)"
+      when: (_fix_revision_reason.stdout | length) > 0
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          patch configmap revision-status-1 -n openshift-apiserver
+          --type=merge -p '{"data":{"reason":""}}'
+      changed_when: true
+      failed_when: false
+      register: _fix_revision_patch
+
+    - name: "[fix] openshift-apiserver revision fix status"
+      ansible.builtin.debug:
+        msg:
+          - "OCP 4.21 openshift-apiserver fix:"
+          - "  audit-0:          {{ 'CREATED' if (_fix_audit0_create is not skipped and _fix_audit0_create.rc | default(1) == 0) else ('already existed' if _fix_audit0_exists.rc == 0 else 'pending (audit-1 not ready yet — will retry)') }}"
+          - "  revision-status-1: {{ 'reason CLEARED' if (_fix_revision_patch is not skipped and _fix_revision_patch.rc | default(1) == 0) else ('already empty' if (_fix_revision_reason.stdout | length) == 0 else 'pending') }}"

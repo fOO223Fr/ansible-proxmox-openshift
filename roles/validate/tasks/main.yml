@@ -1,0 +1,148 @@
+---
+# ── Required variables ───────────────────────────────────────────────
+- name: Validate required variables are set
+  ansible.builtin.assert:
+    that:
+      - cluster_name | length > 0
+      - cluster_base_domain | length > 0
+      - ocp_version | length > 0
+      - infra_ip | length > 0
+      - master_count | int >= 1
+    fail_msg: "Missing required variables. Check overrides.yml and proxmox.yml."
+    success_msg: "Required variables present"
+
+# ── Credentials ───────────────────────────────────────────────────────
+- name: Check pull secret exists
+  ansible.builtin.stat:
+    path: "{{ ocp_pull_secret_file }}"
+  register: _validate_pullsecret
+
+- name: Fail if pull secret is missing
+  ansible.builtin.assert:
+    that: _validate_pullsecret.stat.exists
+    fail_msg: "Pull secret not found at {{ ocp_pull_secret_file }}"
+
+- name: Check SSH public key exists
+  ansible.builtin.stat:
+    path: "{{ ocp_ssh_pubkey_file }}"
+  register: _validate_sshkey
+
+- name: Fail if SSH key is missing
+  ansible.builtin.assert:
+    that: _validate_sshkey.stat.exists
+    fail_msg: "SSH public key not found at {{ ocp_ssh_pubkey_file }}"
+
+- name: Validate pull secret is valid JSON
+  ansible.builtin.set_fact:
+    _validate_ps_json: "{{ lookup('file', ocp_pull_secret_file) | from_json }}"
+  no_log: true
+
+- name: Check pull secret has required registry auth entries
+  ansible.builtin.assert:
+    that:
+      - "'quay.io' in (_validate_ps_json.auths | default({}))"
+      - "'registry.redhat.io' in (_validate_ps_json.auths | default({}))"
+    fail_msg: "Pull secret is missing quay.io or registry.redhat.io auth entries"
+    success_msg: "Pull secret valid"
+
+# ── Proxmox API ───────────────────────────────────────────────────────
+- name: Validate Proxmox API connectivity
+  community.proxmox.proxmox_vm_info:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+  register: _validate_proxmox_api
+  failed_when: false
+  no_log: true
+
+- name: Fail if Proxmox API is unreachable
+  ansible.builtin.assert:
+    that: _validate_proxmox_api is not failed
+    fail_msg: "Cannot connect to Proxmox API at {{ proxmox_api_host }}. Check credentials in proxmox.yml."
+    success_msg: "Proxmox API reachable"
+
+# ── Proxmox SSH ───────────────────────────────────────────────────────
+- name: Validate SSH access to Proxmox
+  ansible.builtin.command:
+    cmd: echo OK
+  delegate_to: proxmox_host
+  register: _validate_proxmox_ssh
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Proxmox SSH is unreachable
+  ansible.builtin.assert:
+    that: _validate_proxmox_ssh.rc == 0
+    fail_msg: "Cannot SSH to Proxmox host {{ proxmox_api_host }}. Check proxmox_ssh_key in proxmox.yml."
+    success_msg: "Proxmox SSH accessible"
+
+# ── Infra VM ──────────────────────────────────────────────────────────
+- name: Check infra VM exists on Proxmox
+  community.proxmox.proxmox_vm_info:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+    vmid: "{{ infra_vmid }}"
+  register: _validate_infra_vm
+  failed_when: false
+
+- name: Fail if infra VM is not found
+  ansible.builtin.assert:
+    that: _validate_infra_vm.proxmox_vms | default([]) | length > 0
+    fail_msg: >-
+      Infra VM (VMID {{ infra_vmid }}) not found on Proxmox node '{{ proxmox_node }}'.
+      Run 'make infra' first.
+    success_msg: "Infra VM (VMID {{ infra_vmid }}) found"
+
+- name: Check infra VM is reachable via SSH
+  ansible.builtin.wait_for:
+    host: "{{ infra_ip }}"
+    port: 22
+    timeout: 10
+  register: _validate_infra_ssh
+  failed_when: false
+
+- name: Fail if infra VM is unreachable
+  ansible.builtin.assert:
+    that: _validate_infra_ssh is not failed
+    fail_msg: "Infra VM at {{ infra_ip }} is not reachable on port 22. Is it running?"
+    success_msg: "Infra VM reachable at {{ infra_ip }}"
+
+# ── Registry ──────────────────────────────────────────────────────────
+- name: Check registry mirror is accessible
+  ansible.builtin.uri:
+    url: "https://{{ infra_ip }}:5000/v2/_catalog"
+    validate_certs: false
+    timeout: 10
+  register: _validate_registry
+  failed_when: false
+
+- name: Warn if registry is empty (make cache not run yet)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: Registry mirror at {{ infra_ip }}:5000 is empty.
+      Run 'make cache' to mirror OCP {{ ocp_version }} images before installing.
+  when:
+    - _validate_registry.status == 200
+    - _validate_registry.json.repositories | default([]) | length == 0
+
+- name: Fail if registry is unreachable
+  ansible.builtin.assert:
+    that: _validate_registry.status == 200
+    fail_msg: >-
+      Registry at https://{{ infra_ip }}:5000 is not responding.
+      Run 'make infra' to ensure the registry containers are running.
+    success_msg: "Registry accessible at {{ infra_ip }}:5000"
+
+- name: Validation complete
+  ansible.builtin.debug:
+    msg:
+      - "All pre-flight checks passed"
+      - "  Proxmox API:  {{ proxmox_api_host }}"
+      - "  Infra VM:     {{ infra_ip }} (VMID {{ infra_vmid }})"
+      - "  Registry:     https://{{ infra_ip }}:5000"
+      - "  Cluster:      {{ cluster_name }}.{{ cluster_base_domain }}"

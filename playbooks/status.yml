@@ -1,0 +1,122 @@
+---
+- name: Show cluster status
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  tasks:
+    - name: Build VM inventory
+      ansible.builtin.set_fact:
+        _status_vm_list:
+          - { id: "{{ helper_vmid }}", role: helper }
+          - { id: "{{ master_vmid_start | int }}", role: master-0 }
+          - { id: "{{ master_vmid_start | int + 1 }}", role: master-1 }
+          - { id: "{{ master_vmid_start | int + 2 }}", role: master-2 }
+          - { id: "{{ worker_vmid_start | int }}", role: worker-0 }
+          - { id: "{{ worker_vmid_start | int + 1 }}", role: worker-1 }
+          - { id: "{{ worker_vmid_start | int + 2 }}", role: worker-2 }
+
+    - name: Add registry to VM list
+      ansible.builtin.set_fact:
+        _status_vm_list: "{{ [{'id': registry_vmid, 'role': 'registry'}] + _status_vm_list }}"
+      when: registry_enabled | default(false) | bool
+
+    - name: Query VM status from Proxmox
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item.id }}"
+      loop: "{{ _status_vm_list }}"
+      loop_control:
+        label: "{{ item.role }}"
+      register: _status_vm_info
+      failed_when: false
+      no_log: true
+
+    - name: Build VM status table
+      ansible.builtin.set_fact:
+        _status_vm_table: |-
+          {% for r in _status_vm_info.results %}
+          {%   set vms = r.proxmox_vms | default([]) %}
+          {%   if vms | length > 0 %}
+          {%     set state = vms[0].status | default('unknown') %}
+          {%   else %}
+          {%     set state = 'not found' %}
+          {%   endif %}
+            {{ '%-12s' | format(r.item.role) }}  VMID {{ '%4s' | format(r.item.id) }}  {{ state }}
+          {% endfor %}
+        _status_running_count: >-
+          {{ _status_vm_info.results
+             | map(attribute='proxmox_vms', default=[])
+             | map('selectattr', 'status', 'equalto', 'running')
+             | map('length') | map('int') | sum }}
+        _status_total_count: "{{ _status_vm_list | length }}"
+
+    - name: Check if kubeconfig exists
+      ansible.builtin.stat:
+        path: "{{ cluster_dir }}/auth/kubeconfig"
+      register: _status_kubeconfig
+
+    - name: Query OCP API for node status
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          get nodes -o wide
+      register: _status_ocp_nodes
+      changed_when: false
+      failed_when: false
+      when:
+        - _status_kubeconfig.stat.exists
+        - _status_running_count | int >= 4
+
+    - name: Query OCP cluster operators
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          get co
+      register: _status_ocp_co
+      changed_when: false
+      failed_when: false
+      when:
+        - _status_kubeconfig.stat.exists
+        - _status_running_count | int >= 4
+        - _status_ocp_nodes.rc | default(1) == 0
+
+    - name: Cluster status
+      vars:
+        _hr: "────────────────────────────────────────────────────────"
+        _api_up: "{{ _status_ocp_nodes.rc | default(1) == 0 }}"
+      ansible.builtin.debug:
+        msg: |-
+
+          {{ cluster_name }}.{{ cluster_base_domain }}   ({{ proxmox_node }})
+          {{ _hr }}
+          VM Power State ({{ _status_running_count }}/{{ _status_total_count }} running)
+          {{ _status_vm_table }}
+          {{ _hr }}
+          {% if _status_running_count | int == 0 %}
+          Cluster is powered off.  Run 'make start' to boot.
+          {% elif _status_running_count | int < 4 %}
+          Cluster is partially running.  Some VMs may be starting up.
+          {% elif _api_up %}
+          OCP Nodes:
+          {{ _status_ocp_nodes.stdout }}
+
+          {% if _status_ocp_co is defined and _status_ocp_co.rc | default(1) == 0 %}
+          Cluster Operators:
+          {{ _status_ocp_co.stdout }}
+          {% endif %}
+          {% else %}
+          VMs are running but OCP API is not yet accessible.
+          {% endif %}
+          {{ _hr }}
+          {% if _status_kubeconfig.stat.exists %}
+          Console:  https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+          API:      https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443
+          {% else %}
+          No cluster installed yet.  Run 'make install' to deploy.
+          {% endif %}

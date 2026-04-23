@@ -1,0 +1,213 @@
+---
+- name: Install podman and python3-cryptography
+  ansible.builtin.dnf:
+    name:
+      - podman
+      - python3-cryptography
+    state: present
+  delegate_to: infra_host
+
+# ── TLS Certificates ──────────────────────────────────────────────────
+- name: Check if registry CA cert already exists
+  ansible.builtin.stat:
+    path: /opt/registry/certs/ca.crt
+  register: _infra_registry_ca_check
+  delegate_to: infra_host
+
+- name: Generate TLS certificates for registry
+  when: not _infra_registry_ca_check.stat.exists
+  block:
+    - name: Generate CA private key
+      community.crypto.openssl_privatekey:
+        path: /opt/registry/certs/ca.key
+        size: 4096
+      delegate_to: infra_host
+
+    - name: Generate CA CSR
+      community.crypto.openssl_csr:
+        path: /opt/registry/certs/ca.csr
+        privatekey_path: /opt/registry/certs/ca.key
+        common_name: "Infra Registry CA"
+        basic_constraints:
+          - "CA:TRUE"
+        basic_constraints_critical: true
+      delegate_to: infra_host
+
+    - name: Generate self-signed CA certificate
+      community.crypto.x509_certificate:
+        path: /opt/registry/certs/ca.crt
+        privatekey_path: /opt/registry/certs/ca.key
+        csr_path: /opt/registry/certs/ca.csr
+        provider: selfsigned
+        selfsigned_not_after: "+3650d"
+      delegate_to: infra_host
+
+    - name: Generate registry private key
+      community.crypto.openssl_privatekey:
+        path: /opt/registry/certs/registry.key
+        size: 4096
+      delegate_to: infra_host
+
+    - name: Generate registry CSR with SAN for infra IP
+      community.crypto.openssl_csr:
+        path: /opt/registry/certs/registry.csr
+        privatekey_path: /opt/registry/certs/registry.key
+        common_name: "{{ infra_ip }}"
+        subject_alt_name:
+          - "IP:{{ infra_ip }}"
+      delegate_to: infra_host
+
+    - name: Sign registry certificate with CA
+      community.crypto.x509_certificate:
+        path: /opt/registry/certs/registry.crt
+        csr_path: /opt/registry/certs/registry.csr
+        ownca_path: /opt/registry/certs/ca.crt
+        ownca_privatekey_path: /opt/registry/certs/ca.key
+        provider: ownca
+        ownca_not_after: "+3650d"
+      delegate_to: infra_host
+
+- name: Trust registry CA on infra VM
+  ansible.builtin.copy:
+    src: /opt/registry/certs/ca.crt
+    dest: /etc/pki/ca-trust/source/anchors/registry-ca.crt
+    remote_src: true
+    mode: '0644'
+  delegate_to: infra_host
+
+- name: Update CA trust store
+  ansible.builtin.command:
+    cmd: update-ca-trust
+  delegate_to: infra_host
+  changed_when: true
+
+# ── Fetch CA cert to controller for use in install-config ─────────────
+- name: Fetch registry CA cert to Ansible controller
+  ansible.builtin.fetch:
+    src: /opt/registry/certs/ca.crt
+    dest: /tmp/registry-ca.crt
+    flat: true
+  delegate_to: infra_host
+
+- name: Store CA cert contents as fact
+  ansible.builtin.set_fact:
+    registry_ca_cert: "{{ lookup('file', '/tmp/registry-ca.crt') }}"
+
+# ── Pull secret for authenticated caches ─────────────────────────────
+- name: Read pull secret on controller
+  ansible.builtin.set_fact:
+    _infra_pull_secret: "{{ lookup('file', ocp_pull_secret_file) | from_json }}"
+  no_log: true
+
+- name: Extract Red Hat registry credentials
+  ansible.builtin.set_fact:
+    _infra_redhat_user: "{{ (_infra_pull_secret.auths['registry.redhat.io'].auth | b64decode).split(':')[0] }}"
+    _infra_redhat_pass: "{{ (_infra_pull_secret.auths['registry.redhat.io'].auth | b64decode).split(':')[1:] | join(':') }}"
+  no_log: true
+
+- name: Copy pull secret to infra VM
+  ansible.builtin.copy:
+    src: "{{ ocp_pull_secret_file }}"
+    dest: /tmp/pull-secret.json
+    mode: '0600'
+  delegate_to: infra_host
+
+# ── Registry configuration files ─────────────────────────────────────
+- name: Deploy mirror registry config
+  ansible.builtin.template:
+    src: registry-mirror.yml.j2
+    dest: /opt/registry/conf/registry-mirror.yml
+    mode: '0644'
+  delegate_to: infra_host
+
+- name: Deploy pull-through cache configs
+  ansible.builtin.template:
+    src: registry-cache.yml.j2
+    dest: "/opt/registry/conf/registry-cache-{{ item.name }}.yml"
+    mode: '0644'
+  loop:
+    - { name: quay,   upstream: "https://quay.io",               auth: false }
+    - { name: redhat, upstream: "https://registry.redhat.io",    auth: true }
+    - { name: docker, upstream: "https://registry-1.docker.io",  auth: false }
+    - { name: k8s,    upstream: "https://registry.k8s.io",       auth: false }
+  delegate_to: infra_host
+
+# ── Systemd Quadlet container units (Podman 4.4+) ─────────────────────
+- name: Create quadlet directory
+  ansible.builtin.file:
+    path: /etc/containers/systemd
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  delegate_to: infra_host
+
+- name: Deploy mirror registry quadlet unit
+  ansible.builtin.template:
+    src: registry-mirror.container.j2
+    dest: /etc/containers/systemd/registry-mirror.container
+    owner: root
+    group: root
+    mode: '0644'
+  delegate_to: infra_host
+  notify: Reload systemd daemon
+
+- name: Deploy pull-through cache quadlet units
+  ansible.builtin.template:
+    src: registry-cache.container.j2
+    dest: "/etc/containers/systemd/registry-cache-{{ item.name }}.container"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - { name: quay,   port: 5001 }
+    - { name: redhat, port: 5002 }
+    - { name: docker, port: 5003 }
+    - { name: k8s,    port: 5004 }
+  delegate_to: infra_host
+  notify: Reload systemd daemon
+
+- name: Reload systemd to pick up quadlet units
+  ansible.builtin.systemd:
+    daemon_reload: true
+  delegate_to: infra_host
+
+- name: Enable and start mirror registry
+  ansible.builtin.systemd:
+    name: registry-mirror.service
+    enabled: true
+    state: started
+  delegate_to: infra_host
+
+- name: Enable and start pull-through cache registries
+  ansible.builtin.systemd:
+    name: "registry-cache-{{ item }}.service"
+    enabled: true
+    state: started
+  loop:
+    - quay
+    - redhat
+    - docker
+    - k8s
+  delegate_to: infra_host
+
+# ── Verify ────────────────────────────────────────────────────────────
+- name: Wait for mirror registry to respond
+  ansible.builtin.uri:
+    url: "https://{{ infra_ip }}:5000/v2/_catalog"
+    validate_certs: false
+  register: _infra_registry_check
+  retries: 10
+  delay: 5
+  until: _infra_registry_check.status == 200
+
+- name: Registry configuration complete
+  ansible.builtin.debug:
+    msg:
+      - "Registry ready on infra VM ({{ infra_ip }})"
+      - "  Mirror (port 5000):          https://{{ infra_ip }}:5000"
+      - "  Cache quay.io (port 5001):   https://{{ infra_ip }}:5001"
+      - "  Cache redhat  (port 5002):   https://{{ infra_ip }}:5002"
+      - "  Cache docker  (port 5003):   https://{{ infra_ip }}:5003"
+      - "  Cache k8s     (port 5004):   https://{{ infra_ip }}:5004"
+      - "Run 'make cache' to mirror OCP {{ ocp_version }} images"

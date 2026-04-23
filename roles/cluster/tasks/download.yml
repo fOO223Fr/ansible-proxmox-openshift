@@ -1,0 +1,135 @@
+---
+- name: Check if openshift-install already exists
+  ansible.builtin.stat:
+    path: "{{ openshift_install_bin }}"
+  register: _cluster_installer_check
+
+- name: Download OpenShift tools
+  when: not _cluster_installer_check.stat.exists
+  block:
+    - name: Set download URLs
+      ansible.builtin.set_fact:
+        _cluster_installer_url: >-
+          https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{{ ocp_version }}/openshift-install-linux.tar.gz
+        _cluster_oc_url: >-
+          https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{{ ocp_version }}/openshift-client-linux.tar.gz
+
+    - name: Download openshift-install tarball
+      ansible.builtin.get_url:
+        url: "{{ _cluster_installer_url }}"
+        dest: "{{ installer_dir }}/openshift-install.tar.gz"
+        mode: '0644'
+
+    - name: Extract openshift-install
+      ansible.builtin.unarchive:
+        src: "{{ installer_dir }}/openshift-install.tar.gz"
+        dest: "{{ installer_dir }}"
+        remote_src: true
+
+    - name: Make openshift-install executable
+      ansible.builtin.file:
+        path: "{{ openshift_install_bin }}"
+        mode: '0755'
+
+    - name: Download oc client tarball
+      ansible.builtin.get_url:
+        url: "{{ _cluster_oc_url }}"
+        dest: "{{ installer_dir }}/oc.tar.gz"
+        mode: '0644'
+
+    - name: Extract oc client
+      ansible.builtin.unarchive:
+        src: "{{ installer_dir }}/oc.tar.gz"
+        dest: "{{ installer_dir }}"
+        remote_src: true
+
+    - name: Make oc and kubectl executable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: '0755'
+      loop:
+        - "{{ installer_dir }}/oc"
+        - "{{ installer_dir }}/kubectl"
+
+- name: Verify installer version
+  ansible.builtin.command:
+    cmd: "{{ openshift_install_bin }} version"
+  register: _cluster_installer_version
+  changed_when: false
+
+- name: Display installer version
+  ansible.builtin.debug:
+    msg: "Using: {{ _cluster_installer_version.stdout_lines[0] }}"
+
+# ── coreos-installer ─────────────────────────────────────────
+- name: Check if coreos-installer already exists
+  ansible.builtin.stat:
+    path: "{{ coreos_installer_bin }}"
+  register: _cluster_coreos_check
+
+- name: Download coreos-installer
+  when: not _cluster_coreos_check.stat.exists
+  ansible.builtin.get_url:
+    url: "{{ coreos_installer_url }}"
+    dest: "{{ coreos_installer_bin }}"
+    mode: '0755'
+
+- name: Verify coreos-installer
+  ansible.builtin.command:
+    cmd: "{{ coreos_installer_bin }} --version"
+  register: _cluster_coreos_version
+  changed_when: false
+
+- name: Display coreos-installer version
+  ansible.builtin.debug:
+    msg: "Using: {{ _cluster_coreos_version.stdout }}"
+
+# ── RHCOS live ISO ───────────────────────────────────────────
+# The ISO is cached directly on the Proxmox ISO storage — it persists across
+# installs and reboots. The controller never stores it locally.
+# Filename includes OCP version so multiple versions coexist cleanly.
+- name: Set RHCOS ISO filename and Proxmox path
+  ansible.builtin.set_fact:
+    _cluster_rhcos_iso_name: "rhcos-live-{{ ocp_version }}.x86_64.iso"
+    _cluster_rhcos_proxmox_path: "{{ iso_storage_path }}/rhcos-live-{{ ocp_version }}.x86_64.iso"
+
+- name: Check if RHCOS live ISO already exists on Proxmox
+  ansible.builtin.stat:
+    path: "{{ _cluster_rhcos_proxmox_path }}"
+  register: _cluster_rhcos_check
+  delegate_to: proxmox_host
+
+- name: Download RHCOS live ISO directly to Proxmox ISO storage
+  when: not _cluster_rhcos_check.stat.exists
+  block:
+    - name: Get RHCOS stream metadata
+      ansible.builtin.command:
+        cmd: "{{ openshift_install_bin }} coreos print-stream-json"
+      register: _cluster_stream_json
+      changed_when: false
+
+    - name: Extract RHCOS ISO URL
+      ansible.builtin.set_fact:
+        _cluster_rhcos_iso_url: >-
+          {{ (_cluster_stream_json.stdout | from_json).architectures.x86_64.artifacts.metal.formats.iso.disk.location }}
+
+    - name: Download RHCOS live ISO to Proxmox (cached permanently — never re-downloaded for this OCP version)
+      ansible.builtin.get_url:
+        url: "{{ _cluster_rhcos_iso_url }}"
+        dest: "{{ _cluster_rhcos_proxmox_path }}"
+        mode: '0644'
+      delegate_to: proxmox_host
+
+- name: RHCOS ISO already cached on Proxmox
+  when: _cluster_rhcos_check.stat.exists
+  ansible.builtin.debug:
+    msg: "RHCOS ISO already on Proxmox at {{ _cluster_rhcos_proxmox_path }} — skipping download"
+
+- name: All tools and images ready
+  ansible.builtin.debug:
+    msg:
+      - "Tools cached in: {{ installer_dir }}"
+      - "  openshift-install: {{ openshift_install_bin }}"
+      - "  oc: {{ oc_bin }}"
+      - "  coreos-installer: {{ coreos_installer_bin }}"
+      - "  RHCOS ISO: {{ rhcos_iso_path }}"

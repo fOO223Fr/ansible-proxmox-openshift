@@ -1,0 +1,250 @@
+---
+# Allocates VMIDs, IPs, MACs, and CIDRs for a new cluster.
+# Called from register_cluster.yml.
+# Sets facts: bootstrap_vmid, bootstrap_ip, bootstrap_mac,
+#             master_vmids, master_ips, master_macs,
+#             worker_vmids, worker_ips, worker_macs,
+#             cluster_network_cidr, service_network_cidr
+
+# ── Read infra VM state ───────────────────────────────────────────────
+- name: Read clusters.json from infra VM
+  ansible.builtin.slurp:
+    src: /etc/infra/clusters.json
+  delegate_to: infra_host
+  register: _alloc_clusters_raw
+
+- name: Parse clusters.json
+  ansible.builtin.set_fact:
+    _alloc_clusters: "{{ _alloc_clusters_raw.content | b64decode | from_json }}"
+
+- name: Read dnsmasq lease file
+  ansible.builtin.slurp:
+    src: /var/lib/dnsmasq/dnsmasq.leases
+  delegate_to: infra_host
+  register: _alloc_leases_raw
+  failed_when: false
+
+# ── Build set of used IPs ─────────────────────────────────────────────
+- name: Collect IPs already reserved in clusters.json
+  ansible.builtin.set_fact:
+    _alloc_reserved_ips: "{{ (_alloc_clusters.values() | map(attribute='bootstrap_ip') | list)
+                             + (_alloc_clusters.values() | map(attribute='master_ips') | flatten | list)
+                             + (_alloc_clusters.values() | map(attribute='worker_ips') | flatten | list) }}"
+
+# regex_findall with capture group returns a list — no multiline block needed
+- name: Parse leased IPs from dnsmasq lease file
+  ansible.builtin.set_fact:
+    _alloc_leased_ips: "{{ (_alloc_leases_raw.content | default('') | b64decode) | regex_findall('(?m)^\\d+ \\S+ (\\S+) ') }}"
+
+- name: Build complete set of used IPs
+  ansible.builtin.set_fact:
+    _alloc_used_ips: "{{ (_alloc_reserved_ips + _alloc_leased_ips) | unique | list }}"
+
+# ── Allocate per-cluster internal subnet ─────────────────────────────
+# Each cluster gets its own /24: 10.0.<N>.0/24 (N = stagger index 1..254)
+# Non-overlapping machine_network_cidr satisfies ACM/Ramen DR and Submariner.
+- name: Collect machine network CIDRs already used by registered clusters
+  ansible.builtin.set_fact:
+    _alloc_used_machine_cidrs: "{{ _alloc_clusters.values() | selectattr('machine_cidr', 'defined') | map(attribute='machine_cidr') | list }}"
+
+- name: Initialize machine CIDR index search
+  ansible.builtin.set_fact:
+    _alloc_machine_cidr_index: -1
+
+- name: Find first unused cluster subnet slot (10.0.<N>.0/24)
+  ansible.builtin.set_fact:
+    _alloc_machine_cidr_index: "{{ item }}"
+  loop: "{{ range(1, 255) | list }}"
+  when:
+    - (_alloc_machine_cidr_index | int) < 0
+    - "'10.0.' + item | string + '.0/24' not in _alloc_used_machine_cidrs"
+
+- name: Fail if all 254 cluster subnet slots are exhausted
+  ansible.builtin.assert:
+    that: "(_alloc_machine_cidr_index | int) > 0"
+    fail_msg: "All 254 cluster internal subnets (10.0.1.0/24–10.0.254.0/24) are in use."
+
+- name: Set cluster machine CIDR and internal gateway
+  ansible.builtin.set_fact:
+    _alloc_machine_cidr: "10.0.{{ _alloc_machine_cidr_index | int }}.0/24"
+    _alloc_cluster_gateway: "{{ infra_cluster_ip }}"
+    _alloc_cluster_dns: "{{ infra_cluster_ip }}"
+
+# ── Allocate IPs within the cluster's /24 ────────────────────────────
+- name: Calculate number of IPs needed
+  ansible.builtin.set_fact:
+    _alloc_ip_count: "{{ 1 + (master_count | int) + (worker_count | int) }}"
+
+- name: Generate IP list for this cluster's /24 (10.0.<N>.10–249)
+  ansible.builtin.set_fact:
+    _alloc_ip_range: "{{ range(10, 250) | map('string') | map('regex_replace', '^', '10.0.' + (_alloc_machine_cidr_index | string) + '.') | list }}"
+
+- name: Select first N free IPs from cluster subnet
+  ansible.builtin.set_fact:
+    _alloc_free_ips: "{{ (_alloc_ip_range | reject('in', _alloc_used_ips) | list)[: _alloc_ip_count | int] }}"
+
+- name: Fail if not enough free IPs available
+  ansible.builtin.assert:
+    that: "_alloc_free_ips | length >= _alloc_ip_count | int"
+    fail_msg: >-
+      Not enough free IPs in {{ _alloc_machine_cidr }}.
+      Need {{ _alloc_ip_count }}, only {{ _alloc_free_ips | length }} available.
+
+- name: Assign IPs to bootstrap, masters, and workers
+  ansible.builtin.set_fact:
+    _alloc_bootstrap_ip: "{{ _alloc_free_ips[0] }}"
+    _alloc_master_ips: "{{ _alloc_free_ips[1: 1 + master_count | int] }}"
+    _alloc_worker_ips: "{{ _alloc_free_ips[1 + master_count | int:] }}"
+
+# ── Generate deterministic MACs ───────────────────────────────────────
+# Format: 52:54:<cluster_byte>:<role_byte>:<index_byte>:00
+# cluster_byte = first byte of md5(cluster_name) — stable across runs
+# role_byte:   00 = bootstrap, 01 = master, 02 = worker
+- name: Compute cluster MAC identifier byte
+  ansible.builtin.set_fact:
+    _alloc_cluster_byte: "{{ (cluster_name | hash('md5'))[0:2] }}"
+
+- name: Set bootstrap MAC
+  ansible.builtin.set_fact:
+    _alloc_bootstrap_mac: "52:54:{{ _alloc_cluster_byte }}:00:00:00"
+
+- name: Initialize master and worker MAC lists
+  ansible.builtin.set_fact:
+    _alloc_master_macs: []
+    _alloc_worker_macs: []
+
+- name: Build master MAC addresses
+  ansible.builtin.set_fact:
+    _alloc_master_macs: "{{ _alloc_master_macs + ['52:54:' + _alloc_cluster_byte + ':01:' + '%02x' | format(item | int) + ':00'] }}"
+  loop: "{{ range(master_count | int) | list }}"
+
+- name: Build worker MAC addresses
+  ansible.builtin.set_fact:
+    _alloc_worker_macs: "{{ _alloc_worker_macs + ['52:54:' + _alloc_cluster_byte + ':02:' + '%02x' | format(item | int) + ':00'] }}"
+  loop: "{{ range(worker_count | int) | list }}"
+
+# ── Allocate VMIDs ────────────────────────────────────────────────────
+- name: Query all existing VMIDs from Proxmox
+  community.proxmox.proxmox_vm_info:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+  register: _alloc_proxmox_vms
+
+- name: Collect VMIDs reserved in clusters.json but not yet deployed
+  ansible.builtin.set_fact:
+    _alloc_reserved_vmids: "{{ (_alloc_clusters.values() | map(attribute='bootstrap_vmid') | list)
+                                + (_alloc_clusters.values() | map(attribute='master_vmids') | flatten | list)
+                                + (_alloc_clusters.values() | map(attribute='worker_vmids') | flatten | list) }}"
+
+- name: Build complete set of used VMIDs
+  ansible.builtin.set_fact:
+    _alloc_used_vmids: "{{ ((_alloc_proxmox_vms.proxmox_vms | map(attribute='vmid') | list)
+                            + _alloc_reserved_vmids) | map('int') | unique | list }}"
+
+- name: Select first N free VMIDs from pool
+  ansible.builtin.set_fact:
+    _alloc_free_vmids: "{{ (range(vmid_pool_start | int, vmid_pool_end | int + 1) | list
+                            | reject('in', _alloc_used_vmids) | list)[: _alloc_ip_count | int] }}"
+
+- name: Fail if not enough free VMIDs available
+  ansible.builtin.assert:
+    that: "_alloc_free_vmids | length >= _alloc_ip_count | int"
+    fail_msg: >-
+      Not enough free VMIDs in pool {{ vmid_pool_start }}-{{ vmid_pool_end }}.
+      Need {{ _alloc_ip_count }}. Used: {{ _alloc_used_vmids | sort | join(', ') }}
+
+- name: Assign VMIDs to bootstrap, masters, and workers
+  ansible.builtin.set_fact:
+    _alloc_bootstrap_vmid: "{{ _alloc_free_vmids[0] | int }}"
+    _alloc_master_vmids: "{{ _alloc_free_vmids[1: 1 + master_count | int] | map('int') | list }}"
+    _alloc_worker_vmids: "{{ _alloc_free_vmids[1 + master_count | int:] | map('int') | list }}"
+
+# ── Allocate pod/service CIDRs ────────────────────────────────────────
+- name: Collect CIDRs already in use by registered clusters
+  ansible.builtin.set_fact:
+    _alloc_used_pod_cidrs: "{{ _alloc_clusters.values() | selectattr('pod_cidr', 'defined') | map(attribute='pod_cidr') | list }}"
+    _alloc_used_svc_cidrs: "{{ _alloc_clusters.values() | selectattr('service_cidr', 'defined') | map(attribute='service_cidr') | list }}"
+
+- name: Auto-assign CIDRs (cluster_network_cidr not set in overrides)
+  when: not cluster_network_cidr
+  block:
+    - name: Initialize CIDR index search
+      ansible.builtin.set_fact:
+        _alloc_cidr_index: -1
+
+    # Loop through stagger indices; set_fact only fires when conditions are met.
+    # First matching index wins because subsequent iterations check _alloc_cidr_index >= 0.
+    - name: Find first unused CIDR stagger index
+      ansible.builtin.set_fact:
+        _alloc_cidr_index: "{{ item }}"
+      loop: "{{ range(32) | list }}"
+      when:
+        - (_alloc_cidr_index | int) < 0
+        - pod_candidate not in _alloc_used_pod_cidrs
+        - svc_candidate not in _alloc_used_svc_cidrs
+      vars:
+        pod_candidate: "10.{{ 128 + item * 4 }}.0.0/14"
+        svc_candidate: "172.{{ 30 + item }}.0.0/16"
+
+    - name: Fail if all 32 CIDR stagger slots are exhausted
+      ansible.builtin.assert:
+        that: "(_alloc_cidr_index | int) >= 0"
+        fail_msg: "All 32 pod/service CIDR stagger slots are in use. Add a new Proxmox host with its own infra VM."
+
+    - name: Set auto-assigned CIDRs
+      ansible.builtin.set_fact:
+        _alloc_pod_cidr: "10.{{ 128 + (_alloc_cidr_index | int) * 4 }}.0.0/14"
+        _alloc_svc_cidr: "172.{{ 30 + (_alloc_cidr_index | int) }}.0.0/16"
+
+- name: Validate and use explicitly set CIDRs from overrides
+  when: cluster_network_cidr | length > 0
+  block:
+    - name: Validate no CIDR collision with existing clusters
+      ansible.builtin.assert:
+        that:
+          - cluster_network_cidr not in _alloc_used_pod_cidrs
+          - service_network_cidr not in _alloc_used_svc_cidrs
+        fail_msg: >-
+          CIDR collision detected.
+          Pod CIDR {{ cluster_network_cidr }} already in use: {{ cluster_network_cidr in _alloc_used_pod_cidrs }}.
+          Svc CIDR {{ service_network_cidr }} already in use: {{ service_network_cidr in _alloc_used_svc_cidrs }}.
+
+    - name: Use CIDRs from overrides
+      ansible.builtin.set_fact:
+        _alloc_pod_cidr: "{{ cluster_network_cidr }}"
+        _alloc_svc_cidr: "{{ service_network_cidr }}"
+
+# ── Expose all allocations as final Ansible facts ─────────────────────
+- name: Set final allocation facts
+  ansible.builtin.set_fact:
+    bootstrap_vmid: "{{ _alloc_bootstrap_vmid }}"
+    bootstrap_ip: "{{ _alloc_bootstrap_ip }}"
+    bootstrap_mac: "{{ _alloc_bootstrap_mac }}"
+    master_vmids: "{{ _alloc_master_vmids }}"
+    master_ips: "{{ _alloc_master_ips }}"
+    master_macs: "{{ _alloc_master_macs }}"
+    worker_vmids: "{{ _alloc_worker_vmids }}"
+    worker_ips: "{{ _alloc_worker_ips }}"
+    worker_macs: "{{ _alloc_worker_macs }}"
+    cluster_network_cidr: "{{ _alloc_pod_cidr }}"
+    service_network_cidr: "{{ _alloc_svc_cidr }}"
+    # cluster_machine_cidr is distinct from machine_network_cidr (proxmox.yml VLAN CIDR)
+    # because extra vars always win and would override a set_fact with the same name.
+    cluster_machine_cidr: "{{ _alloc_machine_cidr }}"
+    cluster_gateway: "{{ _alloc_cluster_gateway }}"
+    cluster_dns: "{{ _alloc_cluster_dns }}"
+
+- name: "Show allocations for cluster '{{ cluster_name }}'"
+  ansible.builtin.debug:
+    msg:
+      - "Bootstrap:       VMID={{ bootstrap_vmid }}  IP={{ bootstrap_ip }}  MAC={{ bootstrap_mac }}"
+      - "Masters:         VMIDs={{ master_vmids }}"
+      - "                 IPs={{ master_ips }}"
+      - "                 MACs={{ master_macs }}"
+      - "Workers:         VMIDs={{ worker_vmids }}  IPs={{ worker_ips }}  MACs={{ worker_macs }}"
+      - "Machine network: {{ cluster_machine_cidr }} (gateway: {{ cluster_gateway }}, dns: {{ cluster_dns }})"
+      - "Pod CIDR:        {{ cluster_network_cidr }}"
+      - "Svc CIDR:        {{ service_network_cidr }}"

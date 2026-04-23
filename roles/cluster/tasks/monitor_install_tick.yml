@@ -1,0 +1,59 @@
+---
+- name: Check install progress
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+      OC={{ oc_bin }}
+      NOW=$(date +%H:%M)
+
+      PENDING=$($OC get csr -o go-template='{% raw %}{{range .items}}{{if not .status}}{{.metadata.name}} {{end}}{{end}}{% endraw %}' 2>/dev/null || echo "")
+      if [ -n "$PENDING" ]; then
+        APPROVED=$(echo "$PENDING" | xargs $OC adm certificate approve 2>&1)
+        echo "[$NOW] Approved CSRs: $APPROVED"
+      fi
+
+      SKIP="insights"
+      CO_TOTAL=$($OC get co --no-headers 2>/dev/null | grep -v "^${SKIP} " | wc -l || echo 0)
+      AVAIL_TMPL='{% raw %}{{range .items}}{{if ne .metadata.name "insights"}}'
+      AVAIL_TMPL+='{{range .status.conditions}}'
+      AVAIL_TMPL+='{{if eq .type "Available"}}{{if eq .status "True"}}+{{end}}'
+      AVAIL_TMPL+='{{end}}{{end}}{{end}}{{end}}{% endraw %}'
+      CO_AVAIL=$($OC get co -o go-template="$AVAIL_TMPL" 2>/dev/null \
+        | grep -o '+' | wc -l || echo 0)
+      NA_TMPL='{% raw %}{{range .items}}{{$n := .metadata.name}}'
+      NA_TMPL+='{{if ne $n "insights"}}{{range .status.conditions}}'
+      NA_TMPL+='{{if eq .type "Available"}}'
+      NA_TMPL+='{{if ne .status "True"}}{{$n}} {{end}}'
+      NA_TMPL+='{{end}}{{end}}{{end}}{{end}}{% endraw %}'
+      CO_WAITING=$($OC get co -o go-template="$NA_TMPL" 2>/dev/null || echo "")
+      DG_TMPL='{% raw %}{{range .items}}{{$n := .metadata.name}}'
+      DG_TMPL+='{{if ne $n "insights"}}{{range .status.conditions}}'
+      DG_TMPL+='{{if eq .type "Degraded"}}'
+      DG_TMPL+='{{if eq .status "True"}}{{$n}} {{end}}'
+      DG_TMPL+='{{end}}{{end}}{{end}}{{end}}{% endraw %}'
+      CO_DEGRADED=$($OC get co -o go-template="$DG_TMPL" 2>/dev/null || echo "")
+
+      echo "[$NOW] Operators: ${CO_AVAIL}/${CO_TOTAL} Available"
+      [ -n "$CO_WAITING" ] && echo "  Not available: $CO_WAITING"
+      [ -n "$CO_DEGRADED" ] && echo "  Degraded: $CO_DEGRADED"
+
+      if [ "$CO_TOTAL" -gt 0 ] && [ "$CO_AVAIL" -eq "$CO_TOTAL" ]; then
+        echo "ALL_OPERATORS_AVAILABLE"
+      fi
+    executable: /bin/bash
+  register: cluster_install_tick
+  changed_when: false
+
+- name: "{{ cluster_install_tick.stdout_lines[0] | default('Checking...') }}"
+  ansible.builtin.debug:
+    msg: "{{ cluster_install_tick.stdout }}"
+
+- name: Set install completion flag
+  ansible.builtin.set_fact:
+    cluster_install_complete: "{{ 'ALL_OPERATORS_AVAILABLE' in cluster_install_tick.stdout }}"
+
+- name: Wait before next check
+  ansible.builtin.pause:
+    seconds: 300
+  when: not cluster_install_complete

@@ -1,0 +1,73 @@
+---
+- name: Create ZFS zvol(s) and attach to worker VMs as shared SCSI disks
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  vars:
+    num_volumes: 1
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - worker_ips | length > 0
+          - worker_vmid_start is defined
+          - worker_count is defined
+          - zvol_pool is defined
+          - zvol_size_gb is defined
+        fail_msg: "Missing required variables. Check overrides.yml."
+
+    - name: Build worker VMID list
+      ansible.builtin.set_fact:
+        worker_vmids: "{{ range(worker_vmid_start | int, worker_vmid_start | int + worker_count | int) | list }}"
+
+    - name: Print zvol creation plan
+      ansible.builtin.debug:
+        msg: "Creating {{ num_volumes }} zvol(s) of {{ zvol_size_gb }}GB each in {{ zvol_pool }}"
+
+    - name: Find highest existing zvol index
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          zfs list -r -t volume -o name -H {{ zvol_pool }} 2>/dev/null \
+          | grep "/{{ zvol_name_prefix }}-[0-9]*$" \
+          | sed "s|.*/{{ zvol_name_prefix }}-||" \
+          | sort -n | tail -1 || echo ""
+        executable: /bin/bash
+      delegate_to: proxmox_host
+      register: highest_index_result
+      changed_when: false
+
+    - name: Set start index for new zvols
+      ansible.builtin.set_fact:
+        zvol_start_index: "{{ ((highest_index_result.stdout | trim | default('-1', true)) | int) + 1 }}"
+
+    - name: Compute zvol names
+      ansible.builtin.set_fact:
+        new_zvol_names: >-
+          {{ range(zvol_start_index | int, zvol_start_index | int + num_volumes | int)
+          | map('string')
+          | map('regex_replace', '^(.*)$', zvol_name_prefix ~ '-\1')
+          | list }}
+
+    - name: Create ZFS zvols
+      ansible.builtin.command:
+        cmd: "zfs create -V {{ zvol_size_gb }}G {{ zvol_pool }}/{{ item }}"
+      loop: "{{ new_zvol_names }}"
+      loop_control:
+        label: "{{ zvol_pool }}/{{ item }} ({{ zvol_size_gb }}GB)"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Attach zvols to worker VMs
+      ansible.builtin.include_tasks: tasks/zvol-attach-to-vm.yml
+      loop: "{{ new_zvol_names | product(worker_vmids) | list }}"
+      loop_control:
+        loop_var: zvol_vm_pair
+        label: "{{ zvol_vm_pair[0] }} -> VMID {{ zvol_vm_pair[1] }}"
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: "Created {{ new_zvol_names | length }} zvol(s): {{ new_zvol_names | join(', ') }}"

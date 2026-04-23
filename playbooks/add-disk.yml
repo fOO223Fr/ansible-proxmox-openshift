@@ -1,0 +1,75 @@
+---
+# Hot-add a second raw disk (scsi1) to master VMs of the current cluster.
+# VMs stay running — RHCOS detects the new disk via udev without reboot.
+# Use 'make add-disk' or 'make add-disk DISK_SIZE=300'
+#
+# The disk is left unformatted so TopoLVM, LSO, or ODF can claim it.
+
+- name: Hot-add second disk to cluster master VMs
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    disk_size_gb: 200   # overridden by Makefile: -e disk_size_gb=<DISK_SIZE>
+
+  tasks:
+    - name: Add infra VM to inventory
+      ansible.builtin.include_role:
+        name: infra
+        tasks_from: add_to_inventory
+
+    - name: Read clusters.json to get master VMIDs
+      ansible.builtin.slurp:
+        src: /etc/infra/clusters.json
+      delegate_to: infra_host
+      register: _adddisk_clusters_raw
+
+    - name: Parse clusters.json
+      ansible.builtin.set_fact:
+        _adddisk_clusters: "{{ _adddisk_clusters_raw.content | b64decode | from_json }}"
+
+    - name: Fail if cluster is not registered
+      ansible.builtin.assert:
+        that: cluster_name in _adddisk_clusters
+        fail_msg: >-
+          Cluster '{{ cluster_name }}' is not registered in the infra VM.
+          Run 'make install' first, or check cluster_name in overrides.yml.
+
+    - name: Set master VMIDs fact
+      ansible.builtin.set_fact:
+        _adddisk_master_vmids: "{{ _adddisk_clusters[cluster_name].master_vmids }}"
+
+    - name: Check which masters already have a data disk (scsi1)
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          qm config {{ item }} | grep "^scsi1:" || echo "NOT_CONFIGURED"
+        executable: /bin/bash
+      loop: "{{ _adddisk_master_vmids }}"
+      register: _adddisk_disk_check
+      delegate_to: proxmox_host
+      changed_when: false
+      failed_when: false
+
+    - name: Hot-add data disk to masters that don't have one
+      ansible.builtin.command:
+        cmd: >-
+          qm set {{ item.item }}
+          --scsi1 {{ storage_pool }}:{{ disk_size_gb }},cache=writeback,discard=on,iothread=1
+      loop: "{{ _adddisk_disk_check.results }}"
+      loop_control:
+        label: "VMID {{ item.item }}"
+      when: "'NOT_CONFIGURED' in item.stdout"
+      delegate_to: proxmox_host
+      register: _adddisk_result
+      changed_when: _adddisk_result.rc == 0
+      failed_when: _adddisk_result.rc != 0 and 'already exists' not in (_adddisk_result.stderr | default(''))
+
+    - name: Disk add complete
+      ansible.builtin.debug:
+        msg:
+          - "Data disk operation complete for cluster '{{ cluster_name }}'"
+          - "  Master VMIDs: {{ _adddisk_master_vmids }}"
+          - "  Disk size:    {{ disk_size_gb }}G"
+          - "  Disk:         /dev/sdb (unformatted — ready for TopoLVM/LSO/ODF)"
+          - "  Note: RHCOS detects the new disk via udev within seconds, no reboot needed"

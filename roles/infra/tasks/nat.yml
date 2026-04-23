@@ -1,0 +1,150 @@
+---
+# Cluster VMs use infra_ip as their default gateway.
+# The infra VM forwards their traffic to network_gateway (UDM Pro)
+# via MASQUERADE NAT on its single NIC.
+
+- name: Install firewalld
+  ansible.builtin.dnf:
+    name: firewalld
+    state: present
+  delegate_to: infra_host
+
+- name: Enable and start firewalld
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+  delegate_to: infra_host
+
+- name: Enable IP forwarding via sysctl
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    sysctl_set: true
+    state: present
+    reload: true
+  delegate_to: infra_host
+
+- name: Enable masquerade NAT in firewalld (public zone)
+  ansible.posix.firewalld:
+    masquerade: true
+    permanent: true
+    immediate: true
+    state: enabled
+    zone: public
+  delegate_to: infra_host
+
+# Add the cluster bridge interface to the internal zone so cluster VMs
+# can use the infra VM as gateway and reach the internet via NAT.
+- name: Add cluster bridge interface to firewalld internal zone
+  ansible.posix.firewalld:
+    zone: internal
+    interface: eth1
+    permanent: true
+    immediate: true
+    state: enabled
+  delegate_to: infra_host
+
+- name: Enable masquerade on internal zone (cluster bridge traffic)
+  ansible.posix.firewalld:
+    masquerade: true
+    permanent: true
+    immediate: true
+    state: enabled
+    zone: internal
+  delegate_to: infra_host
+
+- name: Allow DHCP on internal zone (cluster VMs need DHCP from infra VM)
+  ansible.posix.firewalld:
+    zone: internal
+    service: dhcp
+    permanent: true
+    immediate: true
+    state: enabled
+  delegate_to: infra_host
+
+- name: Allow DNS on internal zone (cluster VMs resolve via infra VM)
+  ansible.posix.firewalld:
+    zone: internal
+    service: dns
+    permanent: true
+    immediate: true
+    state: enabled
+  delegate_to: infra_host
+
+- name: Open OCP + registry ports in internal zone (cluster VMs connect to HAProxy and registry)
+  ansible.posix.firewalld:
+    zone: internal
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop:
+    - '80'
+    - '443'
+    - '6443'
+    - '22623'
+    - '9000'
+    - '5000'
+    - '5001'
+    - '5002'
+    - '5003'
+    - '5004'
+  delegate_to: infra_host
+
+- name: Open HAProxy ports in firewalld
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+    zone: public
+  loop:
+    - '80'
+    - '443'
+    - '6443'
+    - '9000'
+    - '22623'
+  delegate_to: infra_host
+
+- name: Open registry ports in firewalld
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+    zone: public
+  loop:
+    - '5000'
+    - '5001'
+    - '5002'
+    - '5003'
+    - '5004'
+  delegate_to: infra_host
+
+- name: Open DNS port in firewalld
+  ansible.posix.firewalld:
+    service: dns
+    permanent: true
+    immediate: true
+    state: enabled
+    zone: public
+  delegate_to: infra_host
+
+- name: Open DHCP port in firewalld
+  ansible.posix.firewalld:
+    service: dhcp
+    permanent: true
+    immediate: true
+    state: enabled
+    zone: public
+  delegate_to: infra_host
+
+# HAProxy's default SELinux policy only allows ports 80/443/8080/8443.
+# Ports 6443 (OCP API) and 22623 (MCS) require explicit permission.
+- name: Allow HAProxy to bind to any port (SELinux)
+  ansible.posix.seboolean:
+    name: haproxy_connect_any
+    state: true
+    persistent: true
+  delegate_to: infra_host

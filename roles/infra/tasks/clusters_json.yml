@@ -1,0 +1,19 @@
+---
+- name: Create /etc/infra directory
+  ansible.builtin.file:
+    path: /etc/infra
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  delegate_to: infra_host
+
+- name: Initialize clusters.json if absent
+  ansible.builtin.copy:
+    content: "{}\n"
+    dest: /etc/infra/clusters.json
+    owner: root
+    group: root
+    mode: '0644'
+    force: false
+  delegate_to: infra_host

@@ -1,0 +1,17 @@
+---
+- name: Reload dnsmasq
+  ansible.builtin.systemd:
+    name: dnsmasq
+    state: restarted
+  delegate_to: infra_host
+
+- name: Reload HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    state: reloaded
+  delegate_to: infra_host
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+  delegate_to: infra_host

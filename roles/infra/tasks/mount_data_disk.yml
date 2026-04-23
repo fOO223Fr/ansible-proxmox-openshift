@@ -1,0 +1,55 @@
+---
+# The data disk (scsi1 → /dev/sdb) holds all registry data.
+# Format and mount only if not already mounted.
+
+- name: Check if data disk is already formatted
+  ansible.builtin.command:
+    cmd: blkid /dev/sdb
+  delegate_to: infra_host
+  register: _infra_blkid
+  changed_when: false
+  failed_when: false
+
+- name: Format data disk as XFS
+  community.general.filesystem:
+    fstype: xfs
+    dev: /dev/sdb
+  delegate_to: infra_host
+  when: _infra_blkid.rc != 0
+
+- name: Create registry mount point
+  ansible.builtin.file:
+    path: /opt/registry
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  delegate_to: infra_host
+
+- name: Mount data disk at /opt/registry
+  ansible.posix.mount:
+    path: /opt/registry
+    src: /dev/sdb
+    fstype: xfs
+    opts: defaults
+    state: mounted
+  delegate_to: infra_host
+
+- name: Create registry subdirectories on data disk
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - /opt/registry/certs
+    - /opt/registry/auth
+    - /opt/registry/data
+    - /opt/registry/cache-quay
+    - /opt/registry/cache-redhat
+    - /opt/registry/cache-docker
+    - /opt/registry/cache-k8s
+    - /opt/registry/conf
+    - /opt/registry/mirror-workspace
+  delegate_to: infra_host

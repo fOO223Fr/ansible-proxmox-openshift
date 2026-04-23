@@ -1,0 +1,59 @@
+---
+- name: Check disk performance on masters (etcd fsync latency)
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  vars:
+    threshold_excellent_ms: 2
+    threshold_acceptable_ms: 10
+
+  tasks:
+    - name: Validate master IPs are configured
+      ansible.builtin.assert:
+        that:
+          - master_ips | length > 0
+        fail_msg: "master_ips is empty. Check overrides.yml."
+
+    - name: Print benchmark info
+      ansible.builtin.debug:
+        msg:
+          - "etcd Disk Performance Benchmark"
+          - "Masters: {{ master_ips | join(', ') }}"
+          - "  < {{ threshold_excellent_ms }}ms = EXCELLENT"
+          - "  {{ threshold_excellent_ms }}-{{ threshold_acceptable_ms }}ms = OK"
+          - "  > {{ threshold_acceptable_ms }}ms = WARNING"
+
+    - name: Run etcd fio benchmark on masters
+      ansible.builtin.command: >-
+        ssh -i {{ proxmox_ssh_key }} {{ ssh_opts }}
+        core@{{ item }}
+        'podman run --rm --privileged -v /var/lib/etcd:/var/lib/etcd:z
+        quay.io/cloud-bulldozer/etcd-perf 2>&1
+        | grep "99th percentile" | awk "{print \$NF}"'
+      loop: "{{ master_ips }}"
+      loop_control:
+        label: "{{ item }}"
+      register: fio_results
+      changed_when: false
+      failed_when: false
+
+    - name: Display etcd p99 fsync results
+      ansible.builtin.debug:
+        msg: "Master {{ item.item }}: p99 fsync = {{ p99_display }}  [{{ rating }}]"
+      vars:
+        raw: "{{ item.stdout | default('') | trim }}"
+        p99_ms: >-
+          {{ '%.2f' | format(raw | float / 1000000.0)
+          if raw | regex_search('^[0-9]+$') else '0' }}
+        p99_display: >-
+          {{ p99_ms + 'ms' if raw | regex_search('^[0-9]+$') else 'N/A' }}
+        rating: >-
+          {% if item.rc | default(1) != 0 or not raw | regex_search('^[0-9]+$') %}FAILED
+          {% elif p99_ms | float < threshold_excellent_ms %}EXCELLENT
+          {% elif p99_ms | float <= threshold_acceptable_ms %}OK
+          {% else %}WARNING - too slow for etcd{% endif %}
+      loop: "{{ fio_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"

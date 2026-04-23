@@ -1,0 +1,154 @@
+---
+# Mirror OCP release images and warm pull-through caches.
+# Images are mirrored once per OCP version and reused across all clusters.
+# Running this again for the same version is a no-op (idempotent check).
+
+- name: Check if oc-mirror is installed on infra VM
+  ansible.builtin.stat:
+    path: /usr/local/bin/oc-mirror
+  register: _cache_oc_mirror_check
+  delegate_to: infra_host
+
+- name: Install oc-mirror on infra VM
+  when: not _cache_oc_mirror_check.stat.exists
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      curl -sL https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/{{ ocp_version }}/oc-mirror.tar.gz \
+      | tar -xzf - -C /usr/local/bin/ &&
+      chmod +x /usr/local/bin/oc-mirror
+    executable: /bin/bash
+  delegate_to: infra_host
+  changed_when: true
+
+- name: Check if oc client is installed on infra VM
+  ansible.builtin.stat:
+    path: /usr/local/bin/oc
+  register: _cache_oc_check
+  delegate_to: infra_host
+
+- name: Install oc client on infra VM
+  when: not _cache_oc_check.stat.exists
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{{ ocp_version }}/openshift-client-linux.tar.gz \
+      | tar -xzf - -C /usr/local/bin/ oc kubectl &&
+      chmod +x /usr/local/bin/oc /usr/local/bin/kubectl
+    executable: /bin/bash
+  delegate_to: infra_host
+  changed_when: true
+
+- name: Create docker config directory
+  ansible.builtin.file:
+    path: /root/.docker
+    state: directory
+    mode: '0700'
+  delegate_to: infra_host
+  become: true
+
+- name: Set up docker config for oc-mirror authentication
+  ansible.builtin.copy:
+    src: "{{ ocp_pull_secret_file }}"
+    dest: /root/.docker/config.json
+    mode: '0600'
+  delegate_to: infra_host
+  become: true
+
+- name: Copy pull secret to infra VM
+  ansible.builtin.copy:
+    src: "{{ ocp_pull_secret_file }}"
+    dest: /tmp/pull-secret.json
+    mode: '0600'
+  delegate_to: infra_host
+  become: true
+
+- name: Check if OCP {{ ocp_version }} release is already mirrored
+  ansible.builtin.uri:
+    url: "https://{{ infra_ip }}:5000/v2/openshift/release-images/tags/list"
+    validate_certs: false
+  register: _cache_release_tags
+  failed_when: false
+
+- name: Set mirroring needed fact
+  ansible.builtin.set_fact:
+    _cache_needs_mirror: >-
+      {{ _cache_release_tags.status != 200 or
+         ocp_version not in (_cache_release_tags.json.tags | default([]) | join(' ')) }}
+
+- name: Mirror OCP {{ ocp_version }} release images
+  when: _cache_needs_mirror
+  block:
+    # oc adm release mirror streams directly from quay.io to the local registry
+    # in one step — avoids the chunked-upload timeout issues of oc-mirror.
+    - name: Mirror OCP {{ ocp_version }} release images via oc adm
+      ansible.builtin.command:
+        cmd: >-
+          /usr/local/bin/oc adm release mirror
+          --registry-config=/tmp/pull-secret.json
+          --from=quay.io/openshift-release-dev/ocp-release:{{ ocp_version }}-x86_64
+          --to={{ infra_ip }}:5000/openshift/release
+          --to-release-image={{ infra_ip }}:5000/openshift/release-images:{{ ocp_version }}-x86_64
+          --insecure=true
+      delegate_to: infra_host
+      become: true
+      register: _cache_mirror_result
+      async: 7200
+      poll: 60
+      changed_when: true
+      retries: 3
+      delay: 30
+      until: _cache_mirror_result.rc == 0
+
+    - name: Show mirror result (last 10 lines)
+      ansible.builtin.debug:
+        msg: "{{ _cache_mirror_result.stdout_lines[-10:] }}"
+
+- name: OCP {{ ocp_version }} already mirrored
+  when: not _cache_needs_mirror
+  ansible.builtin.debug:
+    msg: "OCP {{ ocp_version }} release images already present — skipping mirror"
+
+# ── Warm pull-through caches with common non-release images ──────────
+- name: Warm registry.redhat.io cache with common operator images
+  ansible.builtin.command:
+    cmd: >-
+      podman pull --tls-verify=false
+      --authfile=/tmp/pull-secret.json
+      {{ infra_ip }}:5002/{{ item }}
+  loop:
+    - ubi9/ubi-minimal:latest
+    - ubi9/ubi-micro:latest
+    - openshift4/ose-oauth-proxy:latest
+    - openshift4/ose-kube-rbac-proxy:latest
+  delegate_to: infra_host
+  become: true
+  changed_when: true
+  failed_when: false
+
+- name: Clean up locally pulled images from infra VM
+  ansible.builtin.command:
+    cmd: podman image prune -af
+  delegate_to: infra_host
+  become: true
+  changed_when: true
+
+- name: Verify mirror registry catalog
+  ansible.builtin.uri:
+    url: "https://{{ infra_ip }}:5000/v2/_catalog"
+    validate_certs: false
+  register: _cache_catalog
+
+- name: Cache warmup complete
+  ansible.builtin.debug:
+    msg:
+      - "Cache warmup complete for OCP {{ ocp_version }}"
+      - "  Mirror (port 5000): {{ _cache_catalog.json.repositories | length }} repos"
+      - "  Pull-through caches warmed: quay.io, registry.redhat.io, docker.io, registry.k8s.io"
+      - ""
+      - "  install-config.yaml will redirect image pulls:"
+      - "    OCP release images -> {{ infra_ip }}:5000 (mirror)"
+      - "    quay.io            -> {{ infra_ip }}:5001 (cache)"
+      - "    registry.redhat.io -> {{ infra_ip }}:5002 (cache)"
+      - "    docker.io          -> {{ infra_ip }}:5003 (cache)"
+      - "    registry.k8s.io    -> {{ infra_ip }}:5004 (cache)"

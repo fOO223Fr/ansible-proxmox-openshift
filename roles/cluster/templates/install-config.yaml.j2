@@ -1,0 +1,45 @@
+apiVersion: v1
+baseDomain: {{ cluster_base_domain }}
+metadata:
+  name: {{ cluster_name }}
+compute:
+- name: worker
+  replicas: {{ worker_count }}
+controlPlane:
+  name: master
+  replicas: {{ master_count }}
+networking:
+  clusterNetwork:
+  - cidr: {{ cluster_network_cidr }}
+    hostPrefix: {{ cluster_network_host_prefix }}
+  machineNetwork:
+  - cidr: {{ cluster_machine_cidr }}
+  serviceNetwork:
+  - {{ service_network_cidr }}
+  networkType: OVNKubernetes
+platform:
+  none: {}
+pullSecret: '{{ ocp_pull_secret }}'
+sshKey: |
+  {{ ocp_ssh_pubkey }}
+additionalTrustBundle: |
+{{ _cluster_registry_ca_bundle | indent(2, true) }}
+imageDigestSources:
+- mirrors:
+  - {{ infra_ip }}:5000/openshift/release-images
+  source: quay.io/openshift-release-dev/ocp-release
+- mirrors:
+  - {{ infra_ip }}:5000/openshift/release
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+- mirrors:
+  - {{ infra_ip }}:5001
+  source: quay.io
+- mirrors:
+  - {{ infra_ip }}:5002
+  source: registry.redhat.io
+- mirrors:
+  - {{ infra_ip }}:5003
+  source: docker.io
+- mirrors:
+  - {{ infra_ip }}:5004
+  source: registry.k8s.io

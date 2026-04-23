@@ -1,0 +1,233 @@
+---
+# ── Restart HAProxy on infra VM to clear stale health checks ──
+- name: Restart HAProxy before booting cluster
+  ansible.builtin.systemd:
+    name: haproxy
+    state: restarted
+  delegate_to: infra_host
+
+# ── Start all VMs ────────────────────────────────────────────
+- name: Start all cluster VMs
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+    vmid: "{{ item.vmid }}"
+    state: started
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: All VMs booting
+  ansible.builtin.debug:
+    msg: |-
+      All {{ _cluster_vms | length }} VMs started. Monitoring bootstrap progress...
+
+# ══════════════════════════════════════════════════════════════
+# Bootstrap monitoring — polls every 30s with live progress
+# Only deletes bootstrap when configmap=complete AND etcd
+# bootstrap member is removed.
+# ══════════════════════════════════════════════════════════════
+- name: Initialize bootstrap tracking
+  ansible.builtin.set_fact:
+    cluster_bootstrap_safe: false
+
+- name: Monitor bootstrap progress (up to 150 min)
+  ansible.builtin.include_tasks: monitor_bootstrap_tick.yml
+  loop: "{{ range(30) | list }}"
+  loop_control:
+    loop_var: _tick
+    label: "tick {{ _tick }}"
+  when: not cluster_bootstrap_safe
+
+- name: Bootstrap timed out
+  when: not cluster_bootstrap_safe
+  block:
+    - name: Collect diagnostic info  # noqa: risky-shell-pipe
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+          echo "=== NODES ==="
+          {{ oc_bin }} get nodes -o wide 2>&1 || echo "(API unreachable)"
+          echo ""
+          echo "=== CLUSTER OPERATORS ==="
+          {{ oc_bin }} get co 2>&1 || echo "(API unreachable)"
+          echo ""
+          echo "=== ETCD PODS ==="
+          {{ oc_bin }} get pods -n openshift-etcd --no-headers 2>&1 || echo "(API unreachable)"
+          echo ""
+          echo "=== BOOTSTRAP CONFIGMAP ==="
+          {{ oc_bin }} get cm bootstrap -n kube-system -o yaml 2>&1 || echo "(not found)"
+        executable: /bin/bash
+      register: _cluster_diag
+      changed_when: false
+      failed_when: false
+
+    - name: Show diagnostics
+      ansible.builtin.debug:
+        msg: "{{ _cluster_diag.stdout }}"
+
+    - name: Fail with explanation
+      ansible.builtin.fail:
+        msg: |-
+          Bootstrap did not complete within 100 minutes.
+          Check the diagnostics above. Common causes:
+            - DNS misconfiguration (*.apps wildcard not resolving)
+            - Registry unreachable from cluster nodes
+            - Insufficient resources (memory/CPU)
+            - DHCP not assigning expected IPs
+
+# ── Clean up bootstrap VM ────────────────────────────────────
+- name: Stop bootstrap VM
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+    vmid: "{{ bootstrap_vmid }}"
+    state: stopped
+    force: true
+  failed_when: false
+
+- name: Delete bootstrap VM with disk purge
+  ansible.builtin.command:
+    cmd: "qm destroy {{ bootstrap_vmid }} --purge --skiplock"
+  delegate_to: proxmox_host
+  changed_when: true
+  failed_when: false
+
+- name: Delete bootstrap ISO from Proxmox
+  ansible.builtin.file:
+    path: "{{ iso_storage_path }}/{{ cluster_name }}-bootstrap.iso"
+    state: absent
+  delegate_to: proxmox_host
+
+- name: Bootstrap VM removed
+  ansible.builtin.debug:
+    msg: "Bootstrap VM deleted. Cluster is now self-sustaining on {{ master_count }} master(s)."
+
+# ── Mark cluster as installed in infra VM ─────────────────────
+# Sets installing: false → HAProxy removes bootstrap from API and MCS backends
+- name: Mark cluster as installed in infra VM
+  ansible.builtin.include_role:
+    name: infra
+    tasks_from: mark_installed
+
+# ── Approve CSRs and wait for nodes ───────────────────────────
+- name: Approve CSRs and wait for all nodes (up to 10 min)
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+      PENDING=$( {{ oc_bin }} get csr -o go-template='{% raw %}{{range .items}}{{if not .status}}{{.metadata.name}} {{end}}{{end}}{% endraw %}' )
+      if [ -n "$PENDING" ]; then
+        echo "$PENDING" | xargs {{ oc_bin }} adm certificate approve 2>&1
+      fi
+      READY=$( {{ oc_bin }} get nodes --no-headers 2>/dev/null | grep -c " Ready" || echo 0 )
+      echo "READY_COUNT=$READY"
+    executable: /bin/bash
+  register: _cluster_csr_result
+  changed_when: "'approved' in _cluster_csr_result.stdout"
+  retries: 20
+  delay: 30
+  until: "_cluster_csr_result.stdout is search('READY_COUNT=' ~ ((master_count | int + worker_count | int) | string))"
+
+- name: Display current nodes
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+      get nodes -o wide
+  register: _cluster_nodes
+  changed_when: false
+
+- name: Current node status
+  ansible.builtin.debug:
+    msg: "{{ _cluster_nodes.stdout_lines }}"
+
+# ── Wait for install-complete with live progress ──────────────
+- name: Initialize install tracking
+  ansible.builtin.set_fact:
+    cluster_install_complete: false
+
+- name: Monitor install completion (up to 40 min)
+  ansible.builtin.include_tasks: monitor_install_tick.yml
+  loop: "{{ range(8) | list }}"
+  loop_control:
+    loop_var: _tick
+    label: "tick {{ _tick }}"
+  when: not cluster_install_complete
+
+- name: Install timed out — show operator status
+  when: not cluster_install_complete
+  block:
+    - name: Get operator status
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig get co
+      register: cluster_co_final
+      changed_when: false
+      failed_when: false
+
+    - name: Show status
+      ansible.builtin.debug:
+        msg: "{{ cluster_co_final.stdout }}"
+
+    - name: Fail
+      ansible.builtin.fail:
+        msg: "Not all cluster operators available after 30 minutes."
+
+# ── Final CSR approval ───────────────────────────────────────
+- name: Final CSR approval
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+      PENDING=$( {{ oc_bin }} get csr -o go-template='{% raw %}{{range .items}}{{if not .status}}{{.metadata.name}} {{end}}{{end}}{% endraw %}' )
+      if [ -n "$PENDING" ]; then
+        echo "$PENDING" | xargs {{ oc_bin }} adm certificate approve
+      fi
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+
+# ── Verify cluster ───────────────────────────────────────────
+- name: Get cluster nodes
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+      get nodes -o wide
+  register: _cluster_final_nodes
+  changed_when: false
+  retries: 10
+  delay: 30
+  until: _cluster_final_nodes.rc == 0
+
+- name: Display cluster nodes
+  ansible.builtin.debug:
+    msg: "{{ _cluster_final_nodes.stdout_lines }}"
+
+- name: Installation complete
+  ansible.builtin.debug:
+    msg: |-
+      ====================================
+      OpenShift Cluster Installation Complete!
+      ====================================
+
+      Cluster: {{ cluster_name }}.{{ cluster_base_domain }}
+      Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+      API: https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443
+
+      Credentials:
+        Username: kubeadmin
+        Password: {{ lookup('file', cluster_dir + '/auth/kubeadmin-password') }}
+
+      Access cluster:
+        export KUBECONFIG={{ playbook_dir }}/../kubeconfig
+        ./oc get nodes
+
+      HAProxy stats: http://{{ infra_ip }}:9000/stats
+      ====================================

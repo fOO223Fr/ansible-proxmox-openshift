@@ -1,0 +1,40 @@
+---
+- name: Install GPFS (IBM Spectrum Scale) operator
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../../overrides.yml
+
+  tasks:
+    - name: Check if cluster exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../kubeconfig"
+      register: kubeconfig_check
+      failed_when: not kubeconfig_check.stat.exists
+
+    - name: Check if GPFS is enabled
+      ansible.builtin.assert:
+        that:
+          - gpfs_enabled | default(false) | bool
+        fail_msg: "Set 'gpfs_enabled: true' in overrides.yml"
+
+    - name: Create shared ZFS zvol for GPFS
+      ansible.builtin.command:
+        cmd: "zfs create -V {{ gpfs_volume_size_gb }}G {{ storage_pool }}/{{ cluster_name }}-gpfs"
+      delegate_to: proxmox_host
+      register: zvol_create
+      changed_when: zvol_create.rc == 0
+      failed_when: zvol_create.rc != 0 and 'already exists' not in zvol_create.stderr
+
+    - name: Attach shared zvol to all worker VMs
+      ansible.builtin.command:
+        cmd: "qm set {{ item }} -scsi1 {{ storage_pool }}:{{ cluster_name }}-gpfs,cache=none,discard=on,iothread=1"
+      loop: "{{ range(worker_vmid_start, worker_vmid_start + worker_count) | list }}"
+      delegate_to: proxmox_host
+      register: zvol_attach
+      changed_when: zvol_attach.rc == 0
+      failed_when: zvol_attach.rc != 0 and 'already exists' not in zvol_attach.stderr
+
+    - name: GPFS storage preparation complete
+      ansible.builtin.debug:
+        msg: "Shared zvol created and attached to workers. See IBM docs for operator setup."

@@ -1,0 +1,31 @@
+---
+- name: Set zvol/VM facts
+  ansible.builtin.set_fact:
+    _zvol_name: "{{ zvol_vm_pair[0] }}"
+    _vmid: "{{ zvol_vm_pair[1] }}"
+
+- name: Find next available SCSI slot
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      for slot in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+        if ! qm config {{ _vmid }} | grep -q "^scsi${slot}:"; then
+          echo $slot
+          break
+        fi
+      done
+    executable: /bin/bash
+  delegate_to: proxmox_host
+  register: next_slot
+  changed_when: false
+
+- name: Fail if no SCSI slot available
+  ansible.builtin.fail:
+    msg: "No available SCSI slot on VM {{ _vmid }}."
+  when: next_slot.stdout | trim | length == 0
+
+- name: Attach zvol to VM
+  ansible.builtin.command:
+    cmd: "qm set {{ _vmid }} -scsi{{ next_slot.stdout | trim }} /dev/zvol/{{ zvol_pool }}/{{ _zvol_name }},shared=1"
+  delegate_to: proxmox_host
+  changed_when: true

@@ -1,0 +1,40 @@
+# ── Cluster credentials (contain secrets) ────────────────────
+proxmox.yml
+overrides.yml
+*-kubeconfig
+*-kubeadmin-password
+*-cluster-credentials.txt
+
+# ── Ephemeral work directory ──────────────────────────────────
+tmp/
+
+# ── Legacy paths (kept for safety during transition) ─────────
+kubeconfig
+cluster-credentials.txt
+4.*/
+ocp-*/
+openshift-install
+oc
+kubectl
+
+# ── Logs and retries ─────────────────────────────────────────
+*.log
+*.retry
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# ── Editor / OS ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iso
+.cursor/

@@ -1,0 +1,132 @@
+---
+- name: Install OpenShift cluster on Proxmox
+  hosts: localhost
+  gather_facts: true
+
+  tasks:
+    # ── Pre-flight: verify infra VM exists ───────────────────────────
+    - name: Check infra VM exists on Proxmox
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ infra_vmid }}"
+      register: _install_infra_check
+      failed_when: false
+
+    - name: Fail if infra VM is not found
+      ansible.builtin.fail:
+        msg:
+          - "Infra VM (VMID {{ infra_vmid }}) not found on Proxmox node '{{ proxmox_node }}'."
+          - "Run 'make infra' first to create and configure it."
+      when: _install_infra_check.proxmox_vms | default([]) | length == 0
+
+    # ── Register cluster with infra VM ───────────────────────────────
+    # Allocates IPs, MACs, VMIDs, CIDRs — exposes them as Ansible facts
+    - name: Register cluster and allocate resources
+      ansible.builtin.include_role:
+        name: infra
+        tasks_from: register_cluster
+
+    # ── Create work directories ───────────────────────────────────────
+    - name: Create work directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ installer_dir }}"
+        - "{{ cluster_dir }}"
+        - "{{ iso_dir }}"
+
+    # ── Deploy cluster ────────────────────────────────────────────────
+    - name: Download OCP tools and RHCOS ISO
+      ansible.builtin.include_role:
+        name: cluster
+        tasks_from: download
+      tags: [download]
+
+    - name: Generate ignition configs
+      ansible.builtin.include_role:
+        name: cluster
+        tasks_from: generate_configs
+      tags: [ignition]
+
+    - name: Create per-node ISOs
+      ansible.builtin.include_role:
+        name: cluster
+        tasks_from: create_isos
+      tags: [iso]
+
+    - name: Create cluster VMs on Proxmox
+      ansible.builtin.include_role:
+        name: cluster
+        tasks_from: create_vms
+      tags: [vms]
+
+    - name: Boot VMs and wait for installation
+      ansible.builtin.include_role:
+        name: cluster
+        tasks_from: boot_and_wait
+      tags: [boot, wait]
+
+    # ── Post-install ──────────────────────────────────────────────────
+    - name: Post-installation day-2 configuration
+      ansible.builtin.include_role:
+        name: config
+      tags: [config, post-install]
+
+    # ── Promote credentials to project root (before storage so always saved) ──
+    - name: Copy kubeconfig to project root
+      ansible.builtin.copy:
+        src: "{{ cluster_dir }}/auth/kubeconfig"
+        dest: "{{ kubeconfig_output }}"
+        mode: '0600'
+
+    - name: Copy kubeadmin password to project root
+      ansible.builtin.copy:
+        src: "{{ cluster_dir }}/auth/kubeadmin-password"
+        dest: "{{ kubeadmin_output }}"
+        mode: '0600'
+
+    - name: Write cluster credentials summary
+      ansible.builtin.copy:
+        content: |
+          Cluster: {{ cluster_name }}.{{ cluster_base_domain }}
+          API:     https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443
+          Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+
+          Username: kubeadmin
+          Password: {{ lookup('file', cluster_dir + '/auth/kubeadmin-password') }}
+
+          Kubeconfig: {{ cluster_name }}-kubeconfig
+
+          Installed: {{ ansible_date_time.iso8601 }}
+        dest: "{{ credentials_output }}"
+        mode: '0600'
+
+    - name: Deploy local-path-provisioner as default StorageClass
+      ansible.builtin.include_role:
+        name: post-install-storage
+      tags: [storage]
+
+    - name: Installation complete
+      ansible.builtin.debug:
+        msg:
+          - "======================================================="
+          - "OpenShift Cluster Installation Complete!"
+          - "======================================================="
+          - "Cluster:  {{ cluster_name }}.{{ cluster_base_domain }}"
+          - "Console:  https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}"
+          - "API:      https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443"
+          - "Username: kubeadmin"
+          - "Password: {{ lookup('file', cluster_dir + '/auth/kubeadmin-password') }}"
+          - ""
+          - "Credentials saved to:"
+          - "  {{ kubeconfig_output }}"
+          - "  {{ kubeadmin_output }}"
+          - ""
+          - "HAProxy stats: http://{{ infra_ip }}:9000/stats"
+          - "======================================================="

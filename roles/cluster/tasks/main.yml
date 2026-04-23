@@ -1,0 +1,20 @@
+---
+- name: Download tools
+  ansible.builtin.include_tasks: download.yml
+  tags: [download]
+
+- name: Generate ignition configs
+  ansible.builtin.include_tasks: generate_configs.yml
+  tags: [ignition, config]
+
+- name: Create per-node ISOs
+  ansible.builtin.include_tasks: create_isos.yml
+  tags: [iso]
+
+- name: Create cluster VMs
+  ansible.builtin.include_tasks: create_vms.yml
+  tags: [vms]
+
+- name: Boot and wait for installation
+  ansible.builtin.include_tasks: boot_and_wait.yml
+  tags: [boot, wait]

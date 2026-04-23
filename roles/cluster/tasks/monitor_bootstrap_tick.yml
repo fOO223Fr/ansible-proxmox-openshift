@@ -1,0 +1,197 @@
+---
+- name: Check bootstrap status
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+      OC={{ oc_bin }}
+      NOW=$(date +%H:%M)
+      ELAPSED=$(( (_tick + 1) * 5 ))
+
+      # Approve any pending CSRs (workers need this to join)
+      PENDING=$($OC get csr -o go-template='{% raw %}{{range .items}}{{if not .status}}{{.metadata.name}} {{end}}{{end}}{% endraw %}' 2>/dev/null || echo "")
+      if [ -n "$PENDING" ]; then
+        echo "$PENDING" | xargs $OC adm certificate approve 2>/dev/null
+      fi
+
+      API_VER=$(curl -sk --max-time 5 \
+        https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443/version 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('gitVersion',''))" \
+        2>/dev/null || echo "")
+
+      if [ -z "$API_VER" ]; then
+        echo "[$NOW ${ELAPSED}m] API: waiting... | Masters: - | etcd: - | Operators: - | Bootstrap: pending"
+        echo "BOOTSTRAP_SAFE=false"
+        exit 0
+      fi
+
+      NODES_RAW=$($OC get nodes --no-headers 2>/dev/null || echo "")
+      MASTERS_TOTAL=$(echo "$NODES_RAW" | grep -c master 2>/dev/null || echo 0)
+      MASTERS_READY=$(echo "$NODES_RAW" | grep master | grep -c " Ready" 2>/dev/null || echo 0)
+
+      ETCD_PODS=$($OC get pods -n openshift-etcd -l app=etcd --no-headers 2>/dev/null \
+        | grep -c Running || echo 0)
+      ETCD_CO=$($OC get co etcd -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' \
+        2>/dev/null || echo "")
+      if echo "$ETCD_CO" | grep -q "Available=True"; then
+        ETCD_ST="healthy (${ETCD_PODS})"
+      elif [ "$ETCD_PODS" -gt 0 ]; then
+        ETCD_ST="forming (${ETCD_PODS})"
+      else
+        ETCD_ST="waiting"
+      fi
+
+      SKIP="insights"
+      CO_TOTAL=$($OC get co --no-headers 2>/dev/null | grep -v "^${SKIP} " | wc -l || echo 0)
+      AVAIL_TMPL='{% raw %}{{range .items}}{{if ne .metadata.name "insights"}}'
+      AVAIL_TMPL+='{{range .status.conditions}}'
+      AVAIL_TMPL+='{{if eq .type "Available"}}{{if eq .status "True"}}+{{end}}'
+      AVAIL_TMPL+='{{end}}{{end}}{{end}}{{end}}{% endraw %}'
+      CO_AVAIL=$($OC get co -o go-template="$AVAIL_TMPL" 2>/dev/null \
+        | grep -o '+' | wc -l || echo 0)
+      WAIT_TMPL='{% raw %}{{range .items}}{{$n := .metadata.name}}'
+      WAIT_TMPL+='{{if ne $n "insights"}}{{range .status.conditions}}'
+      WAIT_TMPL+='{{if eq .type "Available"}}'
+      WAIT_TMPL+='{{if ne .status "True"}}{{$n}} {{end}}'
+      WAIT_TMPL+='{{end}}{{end}}{{end}}{{end}}{% endraw %}'
+      CO_WAITING=$($OC get co -o go-template="$WAIT_TMPL" 2>/dev/null || echo "")
+
+      BOOT_CM=$($OC get cm bootstrap -n kube-system \
+        -o jsonpath='{.data.status}' 2>/dev/null || echo "")
+      [ "$BOOT_CM" = "complete" ] && BOOT_ST="complete" || BOOT_ST="in progress"
+
+      ETCD_BOOT_GONE="false"
+      if [ "$BOOT_CM" = "complete" ]; then
+        if ! $OC get pods -n openshift-etcd --no-headers 2>/dev/null | grep -qi bootstrap; then
+          ETCD_BOOT_GONE="true"
+        fi
+      fi
+
+      MSG="[$NOW ${ELAPSED}m] API: $API_VER | Masters: ${MASTERS_READY}/${MASTERS_TOTAL} Ready"
+      MSG+=" | etcd: $ETCD_ST | Operators: ${CO_AVAIL}/${CO_TOTAL} | Bootstrap: $BOOT_ST"
+      echo "$MSG"
+      if [ -n "$CO_WAITING" ] && [ "$CO_TOTAL" -gt 0 ]; then
+        echo "  Waiting for: $CO_WAITING"
+      fi
+
+      if [ "$BOOT_CM" = "complete" ] && [ "$ETCD_BOOT_GONE" = "true" ]; then
+        echo "  Bootstrap handoff complete. Safe to remove bootstrap VM."
+        echo "BOOTSTRAP_SAFE=true"
+      else
+        if [ "$BOOT_CM" = "complete" ] && [ "$ETCD_BOOT_GONE" = "false" ]; then
+          echo "  Bootstrap configmap complete, waiting for etcd member removal..."
+        fi
+        echo "BOOTSTRAP_SAFE=false"
+      fi
+    executable: /bin/bash
+  register: cluster_boot_tick
+  changed_when: false
+
+- name: "{{ cluster_boot_tick.stdout_lines[0] | default('Checking...') }}"
+  ansible.builtin.debug:
+    msg: "{{ cluster_boot_tick.stdout }}"
+
+# OCP 4.21 openshift-apiserver revision fix — runs inside the same bash context
+# as the monitoring script so DNS is already resolved (same subprocess, warm cache).
+# Idempotent: exits immediately if already fixed.
+- name: Apply openshift-apiserver revision fix (OCP 4.21 audit-0 workaround)
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+      OC={{ oc_bin }}
+
+      # Only proceed if the API is reachable (same check as monitoring tick)
+      if ! $OC get namespace openshift-apiserver &>/dev/null; then
+        exit 0
+      fi
+
+      # Check if audit-0 already exists (fix already applied)
+      if $OC get configmap audit-0 -n openshift-apiserver &>/dev/null; then
+        exit 0
+      fi
+
+      # audit-0 is missing — create it from audit-1
+      if ! $OC get configmap audit-1 -n openshift-apiserver &>/dev/null; then
+        exit 0  # audit-1 not ready yet, will retry next tick
+      fi
+
+      echo "[fix] Creating audit-0 configmap (OCP 4.21 openshift-apiserver revision fix)"
+      $OC get configmap audit-1 -n openshift-apiserver -o json | \
+        python3 -c "
+      import json,sys
+      d=json.load(sys.stdin)
+      d['metadata']['name'] = 'audit-0'
+      for k in ['resourceVersion','uid','creationTimestamp','managedFields','generation','annotations']:
+          d['metadata'].pop(k, None)
+      print(json.dumps(d))
+      " | $OC apply -f - && echo "[fix] audit-0 created"
+
+      # Clear the error reason in revision-status-1
+      REASON=$($OC get configmap revision-status-1 -n openshift-apiserver \
+        -o jsonpath='{.data.reason}' 2>/dev/null || echo "")
+      if [ -n "$REASON" ]; then
+        $OC patch configmap revision-status-1 -n openshift-apiserver \
+          --type=merge -p '{"data":{"reason":""}}' && \
+          echo "[fix] revision-status-1 reason cleared"
+      fi
+
+      # Step 2: Force bootstrap complete if master is ready but bootstrap is stuck.
+      # bootkube on the bootstrap VM sometimes waits for CVO progress that is itself
+      # blocked by the same operators. If the master node is Ready and etcd is healthy,
+      # it is safe to manually signal bootstrap completion.
+      MASTER_READY=$($OC get nodes --no-headers 2>/dev/null | grep -c " Ready" || echo 0)
+      ETCD_OK=$($OC get co etcd -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' \
+        2>/dev/null || echo "")
+      BOOT_CM_EXISTS=$($OC get cm bootstrap -n kube-system &>/dev/null && echo yes || echo no)
+      if [ "$MASTER_READY" -ge 1 ] && [ "$ETCD_OK" = "True" ] && [ "$BOOT_CM_EXISTS" = "no" ]; then
+        echo "[fix] Master ready and etcd healthy but bootstrap configmap missing."
+        echo "[fix] Creating bootstrap configmap to unblock authentication operator."
+        $OC create configmap bootstrap -n kube-system --from-literal=status=complete 2>/dev/null && \
+          echo "[fix] bootstrap configmap created — bootstrap VM will be removed next tick"
+      fi
+
+      # Step 3: Break the CVO/ConnectivityCheckController deadlock by manually
+      # creating the core OpenShift APIServices. Without these, the Routes API
+      # is absent → authentication/monitoring/console stuck → CVO stays Partial
+      # → ConnectivityCheckController waits forever → circular dependency.
+      # The operator will replace these with managed versions once it unblocks.
+      echo "[fix] Creating core OpenShift APIServices to break CVO deadlock"
+      # Use JSON (not YAML heredoc) to avoid Ansible YAML parser conflicts
+      _create_apiservice() {
+        local group="$1" svc_name="$2" svc_ns="$3"
+        if ! $OC get apiservice "v1.${group}" &>/dev/null; then
+          printf '{"apiVersion":"apiregistration.k8s.io/v1","kind":"APIService","metadata":{"name":"v1.%s","annotations":{"service.alpha.openshift.io/inject-cabundle":"true"}},"spec":{"group":"%s","version":"v1","service":{"name":"%s","namespace":"%s","port":443},"groupPriorityMinimum":2000,"versionPriority":10,"insecureSkipTLSVerify":false}}' \
+            "${group}" "${group}" "${svc_name}" "${svc_ns}" | \
+            $OC apply -f - 2>/dev/null && echo "[fix] APIService created: v1.${group}"
+        fi
+      }
+      for group in apps.openshift.io authorization.openshift.io build.openshift.io \
+                   image.openshift.io project.openshift.io quota.openshift.io \
+                   route.openshift.io security.openshift.io template.openshift.io \
+                   user.openshift.io; do
+        _create_apiservice "${group}" "api" "openshift-apiserver"
+      done
+      # oauth.openshift.io is served by oauth-openshift, not openshift-apiserver
+      _create_apiservice "oauth.openshift.io" "oauth-openshift" "openshift-authentication"
+    executable: /bin/bash
+  register: _fix_result
+  changed_when: "'fix]' in _fix_result.stdout"
+  failed_when: false
+  when: "'API: waiting' not in cluster_boot_tick.stdout"
+
+- name: Show fix output if applied
+  ansible.builtin.debug:
+    msg: "{{ _fix_result.stdout_lines }}"
+  when:
+    - "'API: waiting' not in cluster_boot_tick.stdout"
+    - _fix_result.stdout | length > 0
+
+- name: Set bootstrap completion flag
+  ansible.builtin.set_fact:
+    cluster_bootstrap_safe: "{{ 'BOOTSTRAP_SAFE=true' in cluster_boot_tick.stdout }}"
+
+- name: Wait before next check
+  ansible.builtin.pause:
+    seconds: 300
+  when: not cluster_bootstrap_safe

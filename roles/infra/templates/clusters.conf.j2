@@ -1,0 +1,27 @@
+# dnsmasq cluster DNS + DHCP reservations
+# Managed by ansible-proxmox-openshift — do not edit manually
+# Regenerated on every register_cluster / deregister_cluster run
+
+{% if clusters %}
+# ── DNS: wildcard A records ───────────────────────────────────────────
+# All *.cluster.domain names resolve to infra_ip.
+# HAProxy on the infra VM routes from there using SNI.
+{% for cluster_name, cluster in clusters.items() %}
+address=/{{ cluster.domain }}/{{ infra_ip }}
+{% endfor %}
+
+# ── DHCP: static reservations (MAC → IP → hostname) ──────────────────
+{% for cluster_name, cluster in clusters.items() %}
+# {{ cluster_name }}
+dhcp-host={{ cluster.bootstrap_mac }},{{ cluster.bootstrap_ip }},{{ cluster_name }}-bootstrap
+{% for i in range(cluster.master_ips | length) %}
+dhcp-host={{ cluster.master_macs[i] }},{{ cluster.master_ips[i] }},{{ cluster_name }}-master-{{ i }}
+{% endfor %}
+{% for i in range(cluster.worker_ips | length) %}
+dhcp-host={{ cluster.worker_macs[i] }},{{ cluster.worker_ips[i] }},{{ cluster_name }}-worker-{{ i }}
+{% endfor %}
+{% endfor %}
+{% else %}
+# No clusters registered yet.
+# Entries are added automatically by 'make install' via register_cluster.
+{% endif %}

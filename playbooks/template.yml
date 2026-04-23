@@ -1,0 +1,109 @@
+---
+- name: Create Proxmox templates from working cluster
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  vars:
+    template_offset: 1000
+
+  tasks:
+    - name: Build VM list
+      ansible.builtin.set_fact:
+        _tmpl_vms:
+          - { vmid: "{{ helper_vmid }}", name: "{{ cluster_name }}-helper" }
+          - { vmid: "{{ master_vmid_start | int }}", name: "{{ cluster_name }}-master-0" }
+          - { vmid: "{{ master_vmid_start | int + 1 }}", name: "{{ cluster_name }}-master-1" }
+          - { vmid: "{{ master_vmid_start | int + 2 }}", name: "{{ cluster_name }}-master-2" }
+          - { vmid: "{{ worker_vmid_start | int }}", name: "{{ cluster_name }}-worker-0" }
+          - { vmid: "{{ worker_vmid_start | int + 1 }}", name: "{{ cluster_name }}-worker-1" }
+          - { vmid: "{{ worker_vmid_start | int + 2 }}", name: "{{ cluster_name }}-worker-2" }
+
+    - name: Add registry to list if enabled
+      ansible.builtin.set_fact:
+        _tmpl_vms: >-
+          {{ [{'vmid': registry_vmid, 'name': cluster_name + '-registry'}] + _tmpl_vms }}
+      when: registry_enabled | default(false) | bool
+
+    - name: Display template plan
+      ansible.builtin.debug:
+        msg: |-
+          Creating templates (offset +{{ template_offset }}):
+          {% for vm in _tmpl_vms %}
+            {{ vm.name }} VMID {{ vm.vmid }} -> template VMID {{ vm.vmid | int + template_offset }}
+          {% endfor %}
+
+    - name: Stop all VMs gracefully
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item.vmid }}"
+        state: stopped
+        force: false
+        timeout: 120
+      loop: "{{ _tmpl_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: false
+
+    - name: Wait for VMs to stop
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: Remove old templates if they exist
+      ansible.builtin.command:
+        cmd: "qm destroy {{ item.vmid | int + template_offset }} --purge --skiplock"
+      loop: "{{ _tmpl_vms }}"
+      loop_control:
+        label: "template {{ item.vmid | int + template_offset }}"
+      delegate_to: proxmox_host
+      failed_when: false
+      changed_when: true
+
+    - name: Clone VMs to template VMIDs (full clone)
+      ansible.builtin.command:
+        cmd: >-
+          qm clone {{ item.vmid }} {{ item.vmid | int + template_offset }}
+          --full --name {{ item.name }}-template
+      loop: "{{ _tmpl_vms }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.vmid | int + template_offset }}"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Convert clones to templates
+      ansible.builtin.command:
+        cmd: "qm template {{ item.vmid | int + template_offset }}"
+      loop: "{{ _tmpl_vms }}"
+      loop_control:
+        label: "{{ item.name }}-template ({{ item.vmid | int + template_offset }})"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Start original VMs back up
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item.vmid }}"
+        state: started
+      loop: "{{ _tmpl_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: false
+
+    - name: Templates created
+      ansible.builtin.debug:
+        msg: |-
+          Templates created on {{ proxmox_node }}:
+          {% for vm in _tmpl_vms %}
+            {{ vm.name }}-template  VMID {{ vm.vmid | int + template_offset }}
+          {% endfor %}
+
+          Original VMs restarted. Use 'make restore' to recreate cluster from templates.

@@ -1,0 +1,64 @@
+---
+# ══════════════════════════════════════════════════════════════════════
+# proxmox.yml.example — Proxmox host + infra VM configuration reference
+#
+# Copy to proxmox.yml and fill in values for your environment.
+# proxmox.yml is gitignored (contains API token secret).
+# ══════════════════════════════════════════════════════════════════════
+
+# ── PROXMOX HOST [REQUIRED] ───────────────────────────────────────────
+proxmox_api_host: 10.0.0.3           # IP or hostname of Proxmox host
+proxmox_node: pve                    # Proxmox node name (shown in web UI)
+proxmox_api_user: root@pam
+proxmox_api_token_id: ansible        # API token ID (create in Datacenter > API Tokens)
+proxmox_api_token_secret: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+proxmox_ssh_key: "{{ '~/.ssh/id_rsa' | expanduser }}"
+
+# ── STORAGE & NETWORK [REQUIRED] ──────────────────────────────────────
+storage_pool: local-zfs              # Proxmox storage pool for VM disks
+network_bridge: vmbr0               # Linux bridge for the OCP VLAN
+network_vlan: 420                   # VLAN tag (null if no VLAN tagging)
+network_gateway: 192.168.1.1        # Physical gateway (your router)
+vlan_network_cidr: 192.168.1.0/24  # VLAN subnet — used only for infra VM cloud-init IP config
+                                    # NOT the cluster machine network (that's 10.0.N.0/24, auto-allocated)
+                                    # Infra VM NATs cluster traffic to here
+
+# ── INFRA VM [REQUIRED] ───────────────────────────────────────────────
+# The permanent shared VM — create once with: make infra
+#
+# BEFORE running make infra on a new host:
+#   1. Create vmbr1 on Proxmox (isolated bridge, no physical NIC):
+#        echo -e "\nauto vmbr1\niface vmbr1 inet manual\n  bridge-ports none\n  bridge-stp off\n  bridge-fd 0" >> /etc/network/interfaces
+#        ifup vmbr1
+#   2. Add net1 on vmbr1 to the infra VM after 'make infra' creates it:
+#        qm set <infra_vmid> --net1 virtio,bridge=vmbr1,firewall=0
+#   3. In Pi-hole (after infra VM is confirmed up):
+#        address=/local.lab/<infra_ip>
+#      This single entry handles DNS for ALL clusters forever.
+#
+# Per-cluster allocation is fully automatic — no DHCP range config needed.
+# Capacity limits per infra VM:
+#   - Machine network (/24): 254 clusters (10.0.1–10.0.254.0/24)
+#   - Pod CIDRs (/14):        32 clusters (10.128–10.252.0.0/14)
+#   - Service CIDRs (/16):   224 clusters (172.30–172.253.0.0/16)
+infra_vmid: 110                      # Must be outside vmid_pool range below
+infra_ip: 192.168.1.2               # Static IP for infra VM on the physical VLAN
+infra_vcpus: 2
+infra_memory_mb: 4096
+infra_disk_gb: 40                   # Root disk
+infra_data_disk_gb: 200             # Data disk — registry mirror + caches live here
+
+# ── CLUSTER INTERNAL NETWORK [REQUIRED] ───────────────────────────────
+# Cluster VMs connect to vmbr1 (isolated bridge, no physical NIC).
+# Infra VM has a second NIC (eth1) on vmbr1 at infra_cluster_ip/16,
+# NATs cluster VM internet traffic through its VLAN-facing NIC.
+# UDM Pro never sees cluster VM DHCP traffic — no DHCP race condition.
+cluster_bridge: vmbr1
+infra_cluster_ip: "10.0.0.1"         # Infra VM internal gateway IP (eth1 on vmbr1)
+
+# ── VMID ALLOCATION POOL [REQUIRED] ───────────────────────────────────
+# Cluster VMIDs (bootstrap, masters, workers) are auto-assigned at
+# install time from this range. Keep it clear of manually created VMs.
+# infra_vmid must be outside this range.
+vmid_pool_start: 200
+vmid_pool_end: 999

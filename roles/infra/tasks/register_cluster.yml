@@ -1,0 +1,110 @@
+---
+# Called by install.yml before cluster VM creation.
+# Allocates IPs, MACs, VMIDs, CIDRs and registers cluster with infra VM.
+# Exposes all allocations as Ansible facts for subsequent tasks.
+
+- name: Add infra VM to inventory
+  ansible.builtin.include_tasks: add_to_inventory.yml
+
+- name: Verify infra VM is reachable
+  ansible.builtin.wait_for:
+    host: "{{ infra_ip }}"
+    port: 22
+    timeout: 15
+    msg: "Infra VM at {{ infra_ip }} is not reachable. Run 'make infra' first."
+
+- name: Allocate VMIDs, IPs, MACs, and CIDRs
+  ansible.builtin.include_tasks: allocate.yml
+
+# ── Write cluster entry to clusters.json ─────────────────────────────
+- name: Read current clusters.json
+  ansible.builtin.slurp:
+    src: /etc/infra/clusters.json
+  delegate_to: infra_host
+  register: _register_clusters_raw
+
+- name: Parse clusters.json
+  ansible.builtin.set_fact:
+    _register_clusters: "{{ _register_clusters_raw.content | b64decode | from_json }}"
+
+- name: Build cluster entry
+  ansible.builtin.set_fact:
+    _register_entry:
+      domain: "{{ cluster_name }}.{{ cluster_base_domain }}"
+      machine_cidr: "{{ cluster_machine_cidr }}"
+      pod_cidr: "{{ cluster_network_cidr }}"
+      service_cidr: "{{ service_network_cidr }}"
+      bootstrap_vmid: "{{ bootstrap_vmid | int }}"
+      bootstrap_ip: "{{ bootstrap_ip }}"
+      bootstrap_mac: "{{ bootstrap_mac }}"
+      master_vmids: "{{ master_vmids | map('int') | list }}"
+      master_ips: "{{ master_ips }}"
+      master_macs: "{{ master_macs }}"
+      worker_vmids: "{{ worker_vmids | map('int') | list }}"
+      worker_ips: "{{ worker_ips }}"
+      worker_macs: "{{ worker_macs }}"
+      installing: true
+
+- name: Write updated clusters.json
+  ansible.builtin.copy:
+    content: "{{ _register_clusters | combine({cluster_name: _register_entry}) | to_nice_json }}\n"
+    dest: /etc/infra/clusters.json
+    owner: root
+    group: root
+    mode: '0644'
+  delegate_to: infra_host
+
+# ── Regenerate dnsmasq config (DNS wildcard + DHCP reservations) ──────
+- name: Read updated clusters.json for template rendering
+  ansible.builtin.slurp:
+    src: /etc/infra/clusters.json
+  delegate_to: infra_host
+  register: _register_clusters_updated_raw
+
+- name: Parse updated clusters.json
+  ansible.builtin.set_fact:
+    _register_clusters_updated: "{{ _register_clusters_updated_raw.content | b64decode | from_json }}"
+
+- name: Regenerate dnsmasq clusters config
+  ansible.builtin.template:
+    src: clusters.conf.j2
+    dest: /etc/dnsmasq.d/clusters.conf
+    owner: root
+    group: root
+    mode: '0644'
+  vars:
+    clusters: "{{ _register_clusters_updated }}"
+  delegate_to: infra_host
+
+- name: Reload dnsmasq
+  ansible.builtin.systemd:
+    name: dnsmasq
+    state: restarted
+  delegate_to: infra_host
+
+# ── Regenerate HAProxy config (new cluster backends) ──────────────────
+- name: Regenerate HAProxy config
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: '0644'
+    validate: haproxy -c -f %s
+  vars:
+    clusters: "{{ _register_clusters_updated }}"
+  delegate_to: infra_host
+
+- name: Reload HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    state: reloaded
+  delegate_to: infra_host
+
+- name: Cluster registered with infra VM
+  ansible.builtin.debug:
+    msg:
+      - "Cluster '{{ cluster_name }}' registered with infra VM"
+      - "  DNS: *.{{ cluster_name }}.{{ cluster_base_domain }} -> {{ infra_ip }}"
+      - "  HAProxy backends added for API, ingress, and MCS"
+      - "  DHCP reservations set for bootstrap + {{ master_count }} master(s) + {{ worker_count }} worker(s)"

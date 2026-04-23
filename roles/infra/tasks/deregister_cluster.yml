@@ -1,0 +1,84 @@
+---
+# Called by destroy.yml after cluster VMs are deleted.
+# Removes cluster entry from clusters.json and reloads dnsmasq + HAProxy.
+
+- name: Add infra VM to inventory
+  ansible.builtin.include_tasks: add_to_inventory.yml
+
+- name: Read clusters.json
+  ansible.builtin.slurp:
+    src: /etc/infra/clusters.json
+  delegate_to: infra_host
+  register: _deregister_clusters_raw
+
+- name: Parse clusters.json
+  ansible.builtin.set_fact:
+    _deregister_clusters: "{{ _deregister_clusters_raw.content | b64decode | from_json }}"
+
+- name: Skip if cluster is not registered (already clean)
+  ansible.builtin.debug:
+    msg: "Cluster '{{ cluster_name }}' not found in clusters.json — nothing to deregister"
+  when: cluster_name not in _deregister_clusters
+
+- name: Deregister cluster
+  when: cluster_name in _deregister_clusters
+  block:
+    - name: Remove cluster from clusters.json
+      ansible.builtin.set_fact:
+        _deregister_updated: >-
+          {{ _deregister_clusters | dict2items
+             | rejectattr('key', 'equalto', cluster_name)
+             | items2dict }}
+
+    - name: Write updated clusters.json
+      ansible.builtin.copy:
+        content: "{{ _deregister_updated | to_nice_json }}\n"
+        dest: /etc/infra/clusters.json
+        owner: root
+        group: root
+        mode: '0644'
+      delegate_to: infra_host
+
+    - name: Regenerate dnsmasq config (removes DNS wildcard and DHCP reservations)
+      ansible.builtin.template:
+        src: clusters.conf.j2
+        dest: /etc/dnsmasq.d/clusters.conf
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        clusters: "{{ _deregister_updated }}"
+      delegate_to: infra_host
+
+    - name: Reload dnsmasq
+      ansible.builtin.systemd:
+        name: dnsmasq
+        state: restarted
+      delegate_to: infra_host
+
+    - name: Regenerate HAProxy config (removes cluster backends)
+      ansible.builtin.template:
+        src: haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        owner: root
+        group: root
+        mode: '0644'
+        validate: haproxy -c -f %s
+      vars:
+        clusters: "{{ _deregister_updated }}"
+      delegate_to: infra_host
+
+    - name: Reload HAProxy
+      ansible.builtin.systemd:
+        name: haproxy
+        state: reloaded
+      delegate_to: infra_host
+
+    - name: Cluster deregistered from infra VM
+      ansible.builtin.debug:
+        msg:
+          - "Cluster '{{ cluster_name }}' deregistered from infra VM"
+          - "  DNS wildcard removed"
+          - "  DHCP reservations removed"
+          - "  HAProxy backends removed"
+          - "  IPs and VMIDs are now free for future clusters"

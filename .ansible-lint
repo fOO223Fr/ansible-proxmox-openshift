@@ -1,0 +1,11 @@
+---
+exclude_paths:
+  - venv/
+  - .cursor/
+
+skip_list:
+  - yaml[line-length]
+
+offline: false
+
+use_default_rules: true

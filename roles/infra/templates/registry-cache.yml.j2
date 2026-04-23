@@ -1,0 +1,22 @@
+version: 0.1
+log:
+  fields:
+    service: registry-cache-{{ item.name }}
+storage:
+  cache:
+    blobdescriptor: inmemory
+  filesystem:
+    rootdirectory: /var/lib/registry
+http:
+  addr: :5000
+  tls:
+    certificate: /certs/registry.crt
+    key: /certs/registry.key
+  headers:
+    X-Content-Type-Options: [nosniff]
+proxy:
+  remoteurl: {{ item.upstream }}
+{% if item.auth | default(false) %}
+  username: "{{ _infra_redhat_user }}"
+  password: "{{ _infra_redhat_pass }}"
+{% endif %}

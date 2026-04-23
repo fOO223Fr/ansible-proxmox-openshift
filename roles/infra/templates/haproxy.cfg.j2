@@ -1,0 +1,119 @@
+# HAProxy configuration — managed by ansible-proxmox-openshift
+# Do not edit manually — regenerated on every register_cluster / deregister_cluster run
+
+global
+    log /dev/log local0
+    maxconn 20000
+
+defaults
+    mode tcp
+    log global
+    timeout connect 10s
+    timeout client  60s
+    timeout server  60s
+    option tcplog
+
+# ── Stats ─────────────────────────────────────────────────────────────
+listen stats
+    bind *:9000
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats show-legends
+
+{% if clusters %}
+# ── API server (port 6443) ────────────────────────────────────────────
+frontend api
+    bind *:6443
+    mode tcp
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+{% for cluster_name, cluster in clusters.items() %}
+    use_backend api_{{ cluster_name }} if { req_ssl_sni -m end .{{ cluster.domain }} }
+{% endfor %}
+
+{% for cluster_name, cluster in clusters.items() %}
+backend api_{{ cluster_name }}
+    mode tcp
+{% if cluster.installing %}
+    server {{ cluster_name }}-bootstrap {{ cluster.bootstrap_ip }}:6443 check
+{% endif %}
+{% for i in range(cluster.master_ips | length) %}
+    server {{ cluster_name }}-master-{{ i }} {{ cluster.master_ips[i] }}:6443 check
+{% endfor %}
+
+{% endfor %}
+
+# ── Ingress HTTPS (port 443) ──────────────────────────────────────────
+frontend ingress_https
+    bind *:443
+    mode tcp
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+{% for cluster_name, cluster in clusters.items() %}
+    use_backend ingress_https_{{ cluster_name }} if { req_ssl_sni -m end .{{ cluster.domain }} }
+{% endfor %}
+
+{% for cluster_name, cluster in clusters.items() %}
+{% set ingress_ips = cluster.worker_ips if cluster.worker_ips | length > 0 else cluster.master_ips %}
+backend ingress_https_{{ cluster_name }}
+    mode tcp
+{% for i in range(ingress_ips | length) %}
+    server {{ cluster_name }}-ingress-{{ i }} {{ ingress_ips[i] }}:443 check
+{% endfor %}
+
+{% endfor %}
+
+# ── Ingress HTTP (port 80) ────────────────────────────────────────────
+frontend ingress_http
+    bind *:80
+    mode http
+{% for cluster_name, cluster in clusters.items() %}
+    use_backend ingress_http_{{ cluster_name }} if { hdr_end(host) .{{ cluster.domain }} }
+{% endfor %}
+
+{% for cluster_name, cluster in clusters.items() %}
+{% set ingress_ips = cluster.worker_ips if cluster.worker_ips | length > 0 else cluster.master_ips %}
+backend ingress_http_{{ cluster_name }}
+    mode http
+{% for i in range(ingress_ips | length) %}
+    server {{ cluster_name }}-ingress-{{ i }} {{ ingress_ips[i] }}:80 check
+{% endfor %}
+
+{% endfor %}
+
+# ── Machine Config Server (port 22623) — install phase only ──────────
+{% set ns = namespace(any_installing=false) %}
+{% for cluster_name, cluster in clusters.items() %}
+{% if cluster.installing %}{% set ns.any_installing = true %}{% endif %}
+{% endfor %}
+{% if ns.any_installing %}
+frontend mcs
+    bind *:22623
+    mode tcp
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+{% for cluster_name, cluster in clusters.items() %}
+{% if cluster.installing %}
+    use_backend mcs_{{ cluster_name }} if { req_ssl_sni -m end .{{ cluster.domain }} }
+{% endif %}
+{% endfor %}
+
+{% for cluster_name, cluster in clusters.items() %}
+{% if cluster.installing %}
+backend mcs_{{ cluster_name }}
+    mode tcp
+    server {{ cluster_name }}-bootstrap {{ cluster.bootstrap_ip }}:22623 check
+{% for i in range(cluster.master_ips | length) %}
+    server {{ cluster_name }}-master-{{ i }} {{ cluster.master_ips[i] }}:22623 check backup
+{% endfor %}
+
+{% endif %}
+{% endfor %}
+{% endif %}
+
+{% else %}
+# No clusters registered yet.
+# Frontends and backends are added automatically by 'make install'.
+{% endif %}

@@ -1,0 +1,6 @@
+---
+- name: Create infra VM if absent
+  ansible.builtin.include_tasks: create_vm.yml
+
+- name: Configure infra VM services
+  ansible.builtin.include_tasks: configure.yml

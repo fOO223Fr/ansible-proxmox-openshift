@@ -1,0 +1,91 @@
+---
+- name: Check if ignition configs already exist
+  ansible.builtin.stat:
+    path: "{{ cluster_dir }}/bootstrap.ign"
+  register: _cluster_ignition_check
+
+- name: Generate ignition configs
+  when: not _cluster_ignition_check.stat.exists
+  block:
+    - name: Create cluster directory
+      ansible.builtin.file:
+        path: "{{ cluster_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Read pull secret
+      ansible.builtin.set_fact:
+        _cluster_pull_secret: "{{ lookup('file', ocp_pull_secret_file) | trim }}"
+
+    - name: Read SSH public key
+      ansible.builtin.set_fact:
+        _cluster_ssh_pubkey: "{{ lookup('file', ocp_ssh_pubkey_file) | trim }}"
+
+    - name: Fetch registry CA certificate from infra VM
+      block:
+        - name: Fetch CA cert from infra VM
+          ansible.builtin.fetch:
+            src: /opt/registry/certs/ca.crt
+            dest: /tmp/registry-ca.crt
+            flat: true
+          delegate_to: infra_host
+
+        - name: Read registry CA certificate
+          ansible.builtin.set_fact:
+            _cluster_registry_ca_bundle: "{{ lookup('file', '/tmp/registry-ca.crt') }}"
+
+    - name: Generate install-config.yaml
+      ansible.builtin.template:
+        src: install-config.yaml.j2
+        dest: "{{ cluster_dir }}/install-config.yaml"
+        mode: '0600'
+      vars:
+        ocp_pull_secret: "{{ _cluster_pull_secret }}"
+        ocp_ssh_pubkey: "{{ _cluster_ssh_pubkey }}"
+
+    - name: Back up install-config.yaml (consumed by openshift-install)
+      ansible.builtin.copy:
+        src: "{{ cluster_dir }}/install-config.yaml"
+        dest: "{{ cluster_dir }}/install-config.yaml.bak"
+        mode: '0600'
+        remote_src: true
+
+    - name: Generate ignition configs
+      ansible.builtin.command:
+        cmd: "{{ openshift_install_bin }} create ignition-configs --dir={{ cluster_dir }}"
+      changed_when: true
+
+- name: Verify ignition files exist
+  ansible.builtin.stat:
+    path: "{{ cluster_dir }}/{{ item }}"
+  register: _cluster_ign_files
+  loop:
+    - bootstrap.ign
+    - master.ign
+    - worker.ign
+    - auth/kubeconfig
+    - auth/kubeadmin-password
+  failed_when: not _cluster_ign_files.stat.exists
+
+- name: Copy kubeconfig to project root
+  ansible.builtin.copy:
+    src: "{{ cluster_dir }}/auth/kubeconfig"
+    dest: "{{ playbook_dir }}/../kubeconfig"
+    mode: '0600'
+    remote_src: true
+
+- name: Copy oc binary to project root
+  ansible.builtin.copy:
+    src: "{{ oc_bin }}"
+    dest: "{{ playbook_dir }}/../oc"
+    mode: '0755'
+    remote_src: true
+
+- name: Save credentials
+  ansible.builtin.copy:
+    content: |
+      Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+      Username: kubeadmin
+      Password: {{ lookup('file', cluster_dir + '/auth/kubeadmin-password') }}
+    dest: "{{ playbook_dir }}/../cluster-credentials.txt"
+    mode: '0600'

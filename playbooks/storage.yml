@@ -1,0 +1,9 @@
+---
+- name: Deploy post-install storage on OpenShift cluster
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Deploy local-path-provisioner and apply tuning
+      ansible.builtin.include_role:
+        name: post-install-storage

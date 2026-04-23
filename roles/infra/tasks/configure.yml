@@ -1,0 +1,21 @@
+---
+- name: Configure cluster bridge NIC (eth1) with static IP
+  ansible.builtin.include_tasks: configure_cluster_nic.yml
+
+- name: Initialize clusters.json
+  ansible.builtin.include_tasks: clusters_json.yml
+
+- name: Mount data disk for registry storage
+  ansible.builtin.include_tasks: mount_data_disk.yml
+
+- name: Configure NAT and IP forwarding
+  ansible.builtin.include_tasks: nat.yml
+
+- name: Configure dnsmasq (DNS + DHCP)
+  ansible.builtin.include_tasks: dnsmasq.yml
+
+- name: Configure HAProxy (SNI routing)
+  ansible.builtin.include_tasks: haproxy.yml
+
+- name: Configure OCP registry (mirror + pull-through caches)
+  ansible.builtin.include_tasks: registry.yml

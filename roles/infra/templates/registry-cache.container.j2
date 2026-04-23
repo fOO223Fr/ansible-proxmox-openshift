@@ -1,0 +1,17 @@
+[Unit]
+Description=OCP Pull-Through Cache — {{ item.name }} (port {{ item.port }})
+After=network-online.target
+
+[Container]
+Image=docker.io/library/registry:2
+PublishPort={{ item.port }}:5000
+Volume=/opt/registry/cache-{{ item.name }}:/var/lib/registry:z
+Volume=/opt/registry/certs:/certs:z
+Volume=/opt/registry/conf/registry-cache-{{ item.name }}.yml:/etc/docker/registry/config.yml:z
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=OCP Mirror Registry (port 5000)
+After=network-online.target
+
+[Container]
+Image=docker.io/library/registry:2
+PublishPort=5000:5000
+Volume=/opt/registry/data:/var/lib/registry:z
+Volume=/opt/registry/certs:/certs:z
+Volume=/opt/registry/conf/registry-mirror.yml:/etc/docker/registry/config.yml:z
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

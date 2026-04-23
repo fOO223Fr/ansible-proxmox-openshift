@@ -1,0 +1,123 @@
+---
+- name: Start OpenShift cluster VMs
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  tasks:
+    - name: Build VM lists
+      ansible.builtin.set_fact:
+        _start_worker_vmids: "{{ range(worker_vmid_start | int, worker_vmid_start | int + worker_count | int) | list }}"
+        _start_master_vmids: "{{ range(master_vmid_start | int, master_vmid_start | int + master_count | int) | list }}"
+
+    - name: Start registry VM
+      when: registry_enabled | default(false) | bool
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ registry_vmid }}"
+        state: started
+      failed_when: false
+
+    - name: Start helper VM
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ helper_vmid }}"
+        state: started
+      failed_when: false
+
+    - name: Wait for HAProxy
+      ansible.builtin.wait_for:
+        host: "{{ helper_ip }}"
+        port: 6443
+        timeout: 120
+        delay: 5
+      failed_when: false
+
+    - name: Start master VMs
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item }}"
+        state: started
+      loop: "{{ _start_master_vmids }}"
+      loop_control:
+        label: "master VMID {{ item }}"
+      failed_when: false
+
+    - name: Start worker VMs
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item }}"
+        state: started
+      loop: "{{ _start_worker_vmids }}"
+      loop_control:
+        label: "worker VMID {{ item }}"
+      failed_when: false
+
+    - name: Wait for OpenShift API
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          get nodes --no-headers
+      register: _start_api_check
+      retries: 20
+      delay: 30
+      until: _start_api_check.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Approve any pending CSRs
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+          PENDING=$( {{ oc_bin }} get csr -o go-template='{% raw %}{{range .items}}{{if not .status}}{{.metadata.name}} {{end}}{{end}}{% endraw %}' )
+          if [ -n "$PENDING" ]; then
+            echo "$PENDING" | xargs {{ oc_bin }} adm certificate approve 2>&1
+          else
+            echo "No pending CSRs"
+          fi
+        executable: /bin/bash
+      register: _start_csr_result
+      changed_when: "'approved' in _start_csr_result.stdout"
+      retries: 5
+      delay: 30
+      until: _start_csr_result.rc == 0
+      when: _start_api_check.rc == 0
+
+    - name: Get cluster node status
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          get nodes -o wide
+      register: _start_nodes
+      changed_when: false
+      failed_when: false
+      when: _start_api_check.rc == 0
+
+    - name: Cluster started
+      ansible.builtin.debug:
+        msg: |-
+          {% if _start_api_check.rc == 0 %}
+          Cluster is up:
+          {{ _start_nodes.stdout | default('') }}
+          {% else %}
+          VMs started but API not yet accessible.
+          Run 'make status' to check progress.
+          {% endif %}

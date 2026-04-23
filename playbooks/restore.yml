@@ -1,0 +1,110 @@
+---
+- name: Restore cluster from Proxmox templates
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../overrides.yml
+
+  vars:
+    template_offset: 1000
+
+  tasks:
+    - name: Build VM list
+      ansible.builtin.set_fact:
+        _restore_vms:
+          - { vmid: "{{ helper_vmid }}", name: "{{ cluster_name }}-helper" }
+          - { vmid: "{{ master_vmid_start | int }}", name: "{{ cluster_name }}-master-0" }
+          - { vmid: "{{ master_vmid_start | int + 1 }}", name: "{{ cluster_name }}-master-1" }
+          - { vmid: "{{ master_vmid_start | int + 2 }}", name: "{{ cluster_name }}-master-2" }
+          - { vmid: "{{ worker_vmid_start | int }}", name: "{{ cluster_name }}-worker-0" }
+          - { vmid: "{{ worker_vmid_start | int + 1 }}", name: "{{ cluster_name }}-worker-1" }
+          - { vmid: "{{ worker_vmid_start | int + 2 }}", name: "{{ cluster_name }}-worker-2" }
+
+    - name: Add registry to list if enabled
+      ansible.builtin.set_fact:
+        _restore_vms: >-
+          {{ [{'vmid': registry_vmid, 'name': cluster_name + '-registry'}] + _restore_vms }}
+      when: registry_enabled | default(false) | bool
+
+    - name: Verify templates exist
+      ansible.builtin.command:
+        cmd: "qm status {{ item.vmid | int + template_offset }}"
+      loop: "{{ _restore_vms }}"
+      loop_control:
+        label: "template {{ item.vmid | int + template_offset }}"
+      delegate_to: proxmox_host
+      changed_when: false
+
+    - name: Destroy existing VMs if present
+      ansible.builtin.command:
+        cmd: "qm stop {{ item.vmid }} --skiplock; qm destroy {{ item.vmid }} --purge --skiplock"
+      loop: "{{ _restore_vms }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.vmid }})"
+      delegate_to: proxmox_host
+      failed_when: false
+      changed_when: true
+
+    - name: Clone from templates (full clone)
+      ansible.builtin.command:
+        cmd: >-
+          qm clone {{ item.vmid | int + template_offset }} {{ item.vmid }}
+          --full --name {{ item.name }}
+      loop: "{{ _restore_vms }}"
+      loop_control:
+        label: "template {{ item.vmid | int + template_offset }} -> {{ item.name }} ({{ item.vmid }})"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Start restored VMs (registry first, then helper, then cluster)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item.vmid }}"
+        state: started
+      loop: "{{ _restore_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for API to come up
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          get nodes --no-headers
+      register: _restore_api
+      retries: 20
+      delay: 30
+      until: _restore_api.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Approve any pending CSRs
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+          PENDING=$( {{ oc_bin }} get csr -o go-template='{% raw %}{{range .items}}{{if not .status}}{{.metadata.name}} {{end}}{{end}}{% endraw %}' )
+          if [ -n "$PENDING" ]; then
+            echo "$PENDING" | xargs {{ oc_bin }} adm certificate approve 2>&1
+          fi
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      when: _restore_api.rc == 0
+
+    - name: Cluster restored
+      ansible.builtin.debug:
+        msg: |-
+          Cluster restored from templates.
+          {% if _restore_api.rc == 0 %}
+          Nodes:
+          {{ _restore_api.stdout }}
+
+          Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
+          {% else %}
+          VMs started. API may need a few minutes to come up after cold boot.
+          Run 'make status' to check.
+          {% endif %}

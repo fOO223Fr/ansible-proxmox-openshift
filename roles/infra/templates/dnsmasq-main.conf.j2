@@ -1,0 +1,36 @@
+# dnsmasq main configuration — managed by ansible-proxmox-openshift
+# Do not edit manually — changes will be overwritten on next 'make infra'
+
+# ── Upstream DNS ──────────────────────────────────────────────────────
+# Use physical gateway (router) as upstream — do not read /etc/resolv.conf
+no-resolv
+server={{ network_gateway }}
+server=8.8.8.8
+
+# ── DNS: listen on all interfaces ───────────────────────────────────
+# eth0 (172.16.29.2): serves DNS for Pi-hole forwarding (server=/local.lab/172.16.29.2)
+# eth1 (10.0.0.1):    serves DNS for cluster VMs on the internal bridge
+# Cluster VMs resolve *.cluster.domain → 172.16.29.2 → HAProxy (reachable via gateway)
+
+# ── DHCP: isolated cluster bridge only ───────────────────────────────
+# DHCP is ONLY served on eth1 (internal cluster bridge, vmbr1).
+# UDM Pro never sees this DHCP traffic — no race condition, no rogue DHCP detection.
+no-dhcp-interface=eth0
+
+# Each cluster gets a /24 within 10.0.0.0/8, allocated by register_cluster.
+dhcp-range=10.0.1.0,10.0.255.254,255.255.0.0,24h
+
+# Tell cluster VMs to use infra VM as their gateway and DNS server
+# Cluster VMs get 172.16.29.2 as DNS (HAProxy is reachable via gateway 10.0.0.1)
+dhcp-option=option:router,{{ infra_cluster_ip }}
+dhcp-option=option:dns-server,{{ infra_ip }}
+
+# Authoritative — infra VM is the sole DHCP server on this bridge
+dhcp-authoritative
+
+# Log DHCP assignments for debugging
+log-dhcp
+
+# ── Reliability ───────────────────────────────────────────────────────
+domain-needed
+bogus-priv

@@ -1,0 +1,209 @@
+---
+# VMIDs, IPs, and MACs are set as facts by register_cluster (allocate.yml).
+# This task just creates the VMs using those facts.
+
+- name: Build VM definitions for all cluster nodes
+  ansible.builtin.set_fact:
+    _cluster_vms: "{{ [bootstrap_def] + master_defs + worker_defs }}"
+  vars:
+    bootstrap_def:
+      name: "{{ cluster_name }}-bootstrap"
+      vmid: "{{ bootstrap_vmid | int }}"
+      role: bootstrap
+      vcpus: "{{ bootstrap_vcpus }}"
+      memory: "{{ bootstrap_memory_mb }}"
+      disk_gb: "{{ bootstrap_disk_gb }}"
+      mac: "{{ bootstrap_mac }}"
+      iso: "{{ cluster_name }}-bootstrap.iso"
+    master_defs: >-
+      {% set nodes = [] -%}
+      {% for i in range(master_count | int) -%}
+      {% set _ = nodes.append({
+        'name': cluster_name + '-master-' + i | string,
+        'vmid': master_vmids[i] | int,
+        'role': 'master',
+        'vcpus': master_vcpus,
+        'memory': master_memory_mb,
+        'disk_gb': master_disk_gb,
+        'mac': master_macs[i],
+        'iso': cluster_name + '-master-' + i | string + '.iso'
+      }) -%}
+      {% endfor -%}
+      {{ nodes }}
+    worker_defs: >-
+      {% set nodes = [] -%}
+      {% for i in range(worker_count | int) -%}
+      {% set _ = nodes.append({
+        'name': cluster_name + '-worker-' + i | string,
+        'vmid': worker_vmids[i] | int,
+        'role': 'worker',
+        'vcpus': worker_vcpus,
+        'memory': worker_memory_mb,
+        'disk_gb': worker_disk_gb,
+        'mac': worker_macs[i],
+        'iso': cluster_name + '-worker-' + i | string + '.iso'
+      }) -%}
+      {% endfor -%}
+      {{ nodes }}
+
+- name: Display cluster VMs to create
+  ansible.builtin.debug:
+    msg: "{{ item.role | upper }}: {{ item.name }} (VMID {{ item.vmid }}, {{ item.vcpus }}vCPU, {{ item.memory }}MB, MAC {{ item.mac }})"
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# ── Create VMs ────────────────────────────────────────────────────────
+- name: Create cluster VMs on Proxmox
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+    vmid: "{{ item.vmid }}"
+    name: "{{ item.name }}"
+    cores: "{{ item.vcpus }}"
+    memory: "{{ item.memory }}"
+    machine: "{{ vm_machine_type }}"
+    bios: "{{ vm_bios }}"
+    scsihw: "{{ vm_scsihw }}"
+    cpu: "{{ vm_cpu_type }}"
+    ostype: l26
+    onboot: false
+    agent: 'enabled=1'
+    tags: "lab,ocp-{{ ocp_version }}-{{ item.role }}"
+    state: present
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# ── EFI disks ─────────────────────────────────────────────────────────
+- name: Check which EFI disks already exist
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      qm config {{ item.vmid }} | grep "^efidisk0:" || echo "NOT_CONFIGURED"
+    executable: /bin/bash
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: _cluster_existing_efi
+  delegate_to: proxmox_host
+  failed_when: false
+  changed_when: false
+
+- name: Configure EFI disk for VMs
+  ansible.builtin.command:
+    cmd: "qm set {{ item.item.vmid }} -efidisk0 {{ storage_pool }}:1,efitype=4m,pre-enrolled-keys=0"
+  loop: "{{ _cluster_existing_efi.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: "'NOT_CONFIGURED' in item.stdout"
+  delegate_to: proxmox_host
+  register: _cluster_efi_config
+  failed_when: _cluster_efi_config.rc != 0 and 'already exists' not in (_cluster_efi_config.stderr | default(''))
+  changed_when: _cluster_efi_config.rc == 0
+
+# ── Boot disks ────────────────────────────────────────────────────────
+- name: Check which boot disks already exist
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      qm config {{ item.vmid }} | grep "^scsi0:" || echo "NOT_CONFIGURED"
+    executable: /bin/bash
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: _cluster_existing_disks
+  delegate_to: proxmox_host
+  failed_when: false
+  changed_when: false
+
+- name: Configure boot disk for VMs
+  ansible.builtin.command:
+    cmd: >-
+      qm set {{ item.item.vmid }}
+      -scsi0 {{ storage_pool }}:{{ item.item.disk_gb }},cache=writeback,discard=on,iothread=1
+  loop: "{{ _cluster_existing_disks.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: "'NOT_CONFIGURED' in item.stdout"
+  delegate_to: proxmox_host
+  register: _cluster_disk_config
+  failed_when: _cluster_disk_config.rc != 0 and 'already exists' not in (_cluster_disk_config.stderr | default(''))
+  changed_when: _cluster_disk_config.rc == 0
+
+# ── Optional data disk (scsi1) for masters ────────────────────────────
+# Used for TopoLVM or Ceph OSD. Only when master_data_disk_gb > 0.
+- name: Check which master data disks already exist
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      qm config {{ item.vmid }} | grep "^scsi1:" || echo "NOT_CONFIGURED"
+    executable: /bin/bash
+  loop: "{{ _cluster_vms | selectattr('role', 'equalto', 'master') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: _cluster_existing_data_disks
+  delegate_to: proxmox_host
+  when: master_data_disk_gb | int > 0
+  failed_when: false
+  changed_when: false
+
+- name: Configure data disk (scsi1) for master VMs
+  ansible.builtin.command:
+    cmd: >-
+      qm set {{ item.item.vmid }}
+      -scsi1 {{ storage_pool }}:{{ master_data_disk_gb }},cache=writeback,discard=on,iothread=1
+  loop: "{{ _cluster_existing_data_disks.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when:
+    - master_data_disk_gb | int > 0
+    - "'NOT_CONFIGURED' in item.stdout"
+  delegate_to: proxmox_host
+  register: _cluster_data_disk_config
+  failed_when: _cluster_data_disk_config.rc != 0 and 'already exists' not in (_cluster_data_disk_config.stderr | default(''))
+  changed_when: _cluster_data_disk_config.rc == 0
+
+# ── Network ───────────────────────────────────────────────────────────
+# Cluster VMs connect to the isolated internal bridge (vmbr1), NOT to VLAN 420.
+# Infra VM bridges vmbr1 to VLAN 420 via NAT — UDM Pro never sees cluster DHCP.
+- name: Configure network for VMs (isolated cluster bridge)
+  ansible.builtin.command:
+    cmd: >-
+      qm set {{ item.vmid }} -net0 {{ network_model }}={{ item.mac }},bridge={{ cluster_bridge }},firewall=0
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: proxmox_host
+  changed_when: true
+
+# ── Attach ISOs ───────────────────────────────────────────────────────
+- name: Attach customized ISOs to VMs
+  ansible.builtin.command:
+    cmd: "qm set {{ item.vmid }} -ide2 {{ iso_storage }}:iso/{{ item.iso }},media=cdrom"
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.iso }}"
+  delegate_to: proxmox_host
+  changed_when: true
+
+# ── Boot order ────────────────────────────────────────────────────────
+- name: Set boot order for VMs
+  ansible.builtin.command:
+    cmd: 'qm set {{ item.vmid }} -boot "order=scsi0;ide2"'
+  loop: "{{ _cluster_vms }}"
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: proxmox_host
+  changed_when: true
+
+- name: VMs created successfully
+  ansible.builtin.debug:
+    msg:
+      - "Created {{ _cluster_vms | length }} VMs on Proxmox:"
+      - "  Bootstrap:  VMID={{ bootstrap_vmid }}  IP={{ bootstrap_ip }}"
+      - "  Masters:    VMIDs={{ master_vmids }}  IPs={{ master_ips }}"
+      - "  Workers:    VMIDs={{ worker_vmids }}  IPs={{ worker_ips }}"

@@ -1,0 +1,79 @@
+---
+- name: Install dnsmasq
+  ansible.builtin.dnf:
+    name: dnsmasq
+    state: present
+  delegate_to: infra_host
+
+# The packaged /etc/dnsmasq.conf has 'interface=lo' and 'bind-interfaces' uncommented
+# which would restrict dnsmasq to loopback only. Remove those so it listens on all
+# interfaces (we control scope via no-dhcp-interface in our 00-main.conf instead).
+- name: Remove restrictive interface directives from /etc/dnsmasq.conf
+  ansible.builtin.replace:
+    path: /etc/dnsmasq.conf
+    regexp: '^(interface=lo|bind-interfaces)$'
+    replace: '#\1'
+  delegate_to: infra_host
+
+- name: Deploy main dnsmasq configuration
+  ansible.builtin.template:
+    src: dnsmasq-main.conf.j2
+    dest: /etc/dnsmasq.d/00-main.conf
+    owner: root
+    group: root
+    mode: '0644'
+  delegate_to: infra_host
+  notify: Reload dnsmasq
+
+- name: Read clusters.json from infra VM
+  ansible.builtin.slurp:
+    src: /etc/infra/clusters.json
+  delegate_to: infra_host
+  register: _infra_clusters_raw
+
+- name: Parse clusters.json
+  ansible.builtin.set_fact:
+    _infra_clusters: "{{ _infra_clusters_raw.content | b64decode | from_json }}"
+
+- name: Deploy clusters dnsmasq configuration (DNS + DHCP reservations)
+  ansible.builtin.template:
+    src: clusters.conf.j2
+    dest: /etc/dnsmasq.d/clusters.conf
+    owner: root
+    group: root
+    mode: '0644'
+  vars:
+    clusters: "{{ _infra_clusters }}"
+  delegate_to: infra_host
+  notify: Reload dnsmasq
+
+- name: Enable and start dnsmasq
+  ansible.builtin.systemd:
+    name: dnsmasq
+    enabled: true
+    state: started
+  delegate_to: infra_host
+
+- name: Configure infra VM to use itself for DNS
+  ansible.builtin.copy:
+    content: |
+      # Managed by ansible-proxmox-openshift
+      # infra VM uses its own dnsmasq for local.lab resolution
+      nameserver 127.0.0.1
+      nameserver {{ network_gateway }}
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: '0644'
+  delegate_to: infra_host
+
+- name: Prevent NetworkManager from overwriting resolv.conf
+  ansible.builtin.copy:
+    content: |
+      [main]
+      dns=none
+    dest: /etc/NetworkManager/conf.d/90-no-dns.conf
+    owner: root
+    group: root
+    mode: '0644'
+  delegate_to: infra_host

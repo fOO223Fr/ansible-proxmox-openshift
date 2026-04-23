@@ -1,0 +1,33 @@
+---
+- name: Mirror OCP release images into infra VM registry
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Verify infra VM is reachable
+      ansible.builtin.wait_for:
+        host: "{{ infra_ip }}"
+        port: 22
+        timeout: 10
+      register: _cache_infra_check
+      failed_when: false
+
+    - name: Fail if infra VM is not reachable
+      ansible.builtin.fail:
+        msg: >-
+          Infra VM at {{ infra_ip }} is not reachable.
+          Run 'make infra' first to create and configure it.
+      when: _cache_infra_check is failed
+
+    - name: Add infra VM to inventory
+      ansible.builtin.add_host:
+        name: infra_host
+        ansible_host: "{{ infra_ip }}"
+        ansible_user: rocky
+        ansible_ssh_private_key_file: "{{ proxmox_ssh_key }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+        ansible_become: true
+        groups: infra
+
+    - name: Warm infra VM registry caches
+      ansible.builtin.include_tasks: ../roles/infra/tasks/cache_warmup.yml

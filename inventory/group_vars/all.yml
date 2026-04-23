@@ -1,0 +1,129 @@
+---
+# ── Proxmox Connection (set in proxmox.yml) ──────────────────
+# These defaults are overridden by proxmox.yml via -e @./proxmox.yml
+proxmox_api_host: ""
+proxmox_node: ""
+proxmox_api_user: root@pam
+proxmox_api_token_id: ""
+proxmox_api_token_secret: ""
+proxmox_ssh_key: "{{ '~/.ssh/id_rsa' | expanduser }}"
+
+# ── Infra VM (set in proxmox.yml) ────────────────────────────
+infra_vmid: 110
+infra_ip: ""
+infra_vcpus: 2
+infra_memory_mb: 4096
+infra_disk_gb: 40
+infra_data_disk_gb: 200
+vmid_pool_start: 200
+vmid_pool_end: 999
+
+# ── Storage & Network (set in proxmox.yml) ───────────────────
+storage_pool: local-zfs
+network_bridge: vmbr0
+network_vlan: ~
+network_model: virtio
+network_rate_limit: 0
+network_gateway: ""
+vlan_network_cidr: ""  # Set in proxmox.yml — the infra VM's VLAN subnet (e.g. 172.16.29.0/24)
+                       # This is NOT the cluster machine network (that is 10.0.N.0/24, auto-allocated per cluster)
+cluster_bridge: vmbr1       # Isolated internal bridge for cluster VMs (set in proxmox.yml)
+# Per-cluster machine network: 10.0.<N>.0/24 — auto-allocated by allocate.yml
+# Per-cluster pod CIDR:        10.(128+N*4).0.0/14 — auto-staggered
+# Per-cluster service CIDR:    172.(30+N).0.0/16 — auto-staggered
+infra_cluster_ip: "10.0.0.1"         # Infra VM's gateway IP on cluster_bridge (eth1)
+
+# ── Cluster Identity (set in overrides.yml) ──────────────────
+cluster_name: ""
+cluster_base_domain: local.lab
+ocp_version: "4.21.0"
+
+# ── OpenShift Credentials (set in overrides.yml) ─────────────
+ocp_pull_secret_file: "{{ '~/.tokens/pull-secret.txt' | expanduser }}"
+ocp_ssh_pubkey_file: "{{ '~/.ssh/id_rsa.pub' | expanduser }}"
+
+# ── Bootstrap Node (temporary — deleted after install) ───────
+bootstrap_vcpus: 8
+bootstrap_memory_mb: 16384
+bootstrap_disk_gb: 120
+
+# ── Master Nodes ─────────────────────────────────────────────
+master_count: 1
+master_vcpus: 8
+master_memory_mb: 32768
+master_disk_gb: 120
+master_data_disk_gb: 0   # 0 = disabled; set > 0 for second raw disk (TopoLVM/Ceph)
+
+# ── Worker Nodes ─────────────────────────────────────────────
+worker_count: 0
+worker_vcpus: 8
+worker_memory_mb: 32768
+worker_disk_gb: 120
+
+# ── Network CIDRs (auto-assigned if not set in overrides) ────
+# Leave empty — register_cluster allocates non-overlapping values
+# from the infra VM's CIDR registry. Set in overrides.yml only
+# if you need specific ranges.
+cluster_network_cidr: ""
+service_network_cidr: ""
+cluster_network_host_prefix: 23
+
+# ── Post-install Tuning ───────────────────────────────────────
+kubelet_max_pods: 500
+local_path_provisioner_path: /opt/local-path-provisioner
+
+# ── Rocky Linux Cloud Image ───────────────────────────────────
+# Used for the infra VM. Cached on Proxmox after first download.
+rocky_cloud_image_url: "https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
+rocky_cloud_image_name: "Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
+rocky_cloud_image_dest: "/var/lib/vz/template/iso/{{ rocky_cloud_image_name }}"
+
+# ── VM Hardware Defaults ──────────────────────────────────────
+vm_machine_type: q35
+vm_bios: ovmf
+vm_cpu_type: host
+vm_scsihw: virtio-scsi-single
+coreos_install_device: /dev/sda
+# Network interface name inside RHCOS VMs (q35 + virtio net0 on Proxmox = enp6s18)
+vm_network_interface: enp6s18
+
+# ── ISO Storage ───────────────────────────────────────────────
+iso_storage: local
+iso_storage_path: /var/lib/vz/template/iso
+
+# ── Directory Layout ──────────────────────────────────────────
+# project_root is resolved at runtime relative to the playbook location.
+# All playbooks live in playbooks/, so dirname gives the project root.
+project_root: "{{ playbook_dir | dirname }}"
+tmp_dir: "{{ project_root }}/tmp"
+installer_dir: "{{ tmp_dir }}/tools/{{ ocp_version }}"
+cluster_dir: "{{ tmp_dir }}/{{ cluster_name }}"
+iso_dir: "{{ cluster_dir }}/isos"
+
+# Binaries downloaded into installer_dir
+oc_bin: "{{ installer_dir }}/oc"
+openshift_install_bin: "{{ installer_dir }}/openshift-install"
+coreos_installer_bin: "{{ installer_dir }}/coreos-installer"
+# RHCOS ISO is cached directly on Proxmox ISO storage (set at runtime by download.yml)
+# rhcos_iso_path kept for backwards compat but no longer used for local storage
+rhcos_iso_path: "{{ installer_dir }}/rhcos-live.x86_64.iso"
+
+# Output files copied to project root after successful install
+kubeconfig_output: "{{ project_root }}/{{ cluster_name }}-kubeconfig"
+kubeadmin_output: "{{ project_root }}/{{ cluster_name }}-kubeadmin-password"
+credentials_output: "{{ project_root }}/{{ cluster_name }}-cluster-credentials.txt"
+
+# ── SSH Options ───────────────────────────────────────────────
+ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+# ── Tool Download URLs ────────────────────────────────────────
+coreos_installer_url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/coreos-installer/latest/coreos-installer"
+
+# ── GPFS Add-on ──────────────────────────────────────────────
+gpfs_enabled: false
+gpfs_volume_size_gb: 100
+
+# ── ZFS Volumes ──────────────────────────────────────────────
+zvol_name_prefix: "shared-vol"
+zvol_size_gb: "{{ gpfs_volume_size_gb }}"
+zvol_pool: "{{ storage_pool }}"

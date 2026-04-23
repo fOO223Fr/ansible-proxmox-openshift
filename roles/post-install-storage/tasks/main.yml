@@ -1,0 +1,315 @@
+---
+# Deploys local-path-provisioner as the default StorageClass on every cluster.
+# Equivalent to AWS gp3-csi — provides dynamic hostPath-backed PVC provisioning.
+# OpenShift-specific fixes are applied automatically (SCC, SELinux, binding mode).
+
+- name: Set kubeconfig path
+  ansible.builtin.set_fact:
+    _storage_kubeconfig: "{{ cluster_dir }}/auth/kubeconfig"
+
+# Create ImageTagMirrorSet to redirect tag-based docker.io pulls to our pull-through cache.
+# imageDigestSources in install-config.yaml only covers digest-based pulls (sha256:...).
+# Tag-based pulls (e.g. :v0.0.30) need this explicit redirect.
+- name: Create ImageTagMirrorSet for docker.io pull-through cache
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: config.openshift.io/v1
+      kind: ImageTagMirrorSet
+      metadata:
+        name: docker-io-mirror
+      spec:
+        imageTagMirrors:
+          - mirrors:
+              - "{{ infra_ip }}:5003"
+            source: docker.io
+    state: present
+
+- name: Verify cluster API is reachable
+  ansible.builtin.command:
+    cmd: "{{ oc_bin }} --kubeconfig={{ _storage_kubeconfig }} get nodes --no-headers"
+  register: _storage_api_check
+  changed_when: false
+  retries: 5
+  delay: 15
+  until: _storage_api_check.rc == 0
+
+# ── Create Namespace ──────────────────────────────────────────────────
+- name: Create local-path-storage namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: local-path-storage
+    state: present
+
+# ── ServiceAccount, ClusterRole, ClusterRoleBinding ──────────────────
+- name: Create ServiceAccount for local-path-provisioner
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: local-path-provisioner-service-account
+        namespace: local-path-storage
+    state: present
+
+- name: Create ClusterRole for local-path-provisioner
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: local-path-provisioner-role
+      rules:
+        - apiGroups: [""]
+          resources: [nodes, persistentvolumeclaims, configmaps, pods, pods/log]
+          verbs: [get, list, watch]
+        - apiGroups: [""]
+          resources: [persistentvolumes]
+          verbs: [get, list, watch, create, patch, delete]
+        - apiGroups: [""]
+          resources: [events]
+          verbs: [create, patch]
+        - apiGroups: [storage.k8s.io]
+          resources: [storageclasses]
+          verbs: [get, list, watch]
+    state: present
+
+- name: Create ClusterRoleBinding for local-path-provisioner
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: local-path-provisioner-bind
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: local-path-provisioner-role
+      subjects:
+        - kind: ServiceAccount
+          name: local-path-provisioner-service-account
+          namespace: local-path-storage
+    state: present
+
+# ── ConfigMap ─────────────────────────────────────────────────────────
+- name: Create ConfigMap for local-path-provisioner
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: local-path-config
+        namespace: local-path-storage
+      data:
+        config.json: |
+          {
+            "nodePathMap": [{
+              "node": "DEFAULT_PATH_FOR_NON_LISTED_NODES",
+              "paths": ["{{ local_path_provisioner_path }}"]
+            }]
+          }
+        setup: |
+          #!/bin/sh
+          set -eu
+          mkdir -m 0777 -p "$VOL_DIR"
+        teardown: |
+          #!/bin/sh
+          set -eu
+          rm -rf "$VOL_DIR"
+        helperPod.yaml: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: helper-pod
+          spec:
+            priorityClassName: system-node-critical
+            tolerations:
+              - key: node.kubernetes.io/disk-pressure
+                operator: Exists
+                effect: NoSchedule
+            containers:
+            - name: helper-pod
+              image: docker.io/library/busybox:latest
+              imagePullPolicy: IfNotPresent
+    state: present
+
+# ── Deployment ────────────────────────────────────────────────────────
+- name: Deploy local-path-provisioner
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: local-path-provisioner
+        namespace: local-path-storage
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: local-path-provisioner
+        template:
+          metadata:
+            labels:
+              app: local-path-provisioner
+          spec:
+            serviceAccountName: local-path-provisioner-service-account
+            containers:
+              - name: local-path-provisioner
+                # Pull from the infra VM's docker.io pull-through cache (port 5003)
+                # to avoid cluster nodes needing direct internet access to docker.io
+                image: "{{ infra_ip }}:5003/rancher/local-path-provisioner:v0.0.30"
+                imagePullPolicy: IfNotPresent
+                command:
+                  - local-path-provisioner
+                  - start
+                  - --config=/etc/config/config.json
+                volumeMounts:
+                  - name: config-volume
+                    mountPath: /etc/config/
+                env:
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+            volumes:
+              - name: config-volume
+                configMap:
+                  name: local-path-config
+    state: present
+
+# ── StorageClass (Immediate binding, set as default) ──────────────────
+- name: Deploy local-path StorageClass
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: local-path
+        annotations:
+          # Set as the cluster-wide default StorageClass (equivalent to gp3-csi on AWS)
+          storageclass.kubernetes.io/is-default-class: "true"
+      provisioner: rancher.io/local-path
+      # Immediate (not WaitForFirstConsumer) prevents StatefulSet deadlock on SNO:
+      # with WaitForFirstConsumer, pod and PVC wait for each other on single-node.
+      volumeBindingMode: Immediate
+      reclaimPolicy: Delete
+    state: present
+
+# ── Grant privileged SCC (required on OpenShift/RHCOS) ───────────────
+- name: Grant privileged SCC to local-path-provisioner service account
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ _storage_kubeconfig }}
+      adm policy add-scc-to-user privileged
+      -z local-path-provisioner-service-account
+      -n local-path-storage
+  changed_when: true
+
+# ── SELinux context fix via MachineConfig ────────────────────────────
+# On RHCOS with SELinux enforcing, the helper pod fails with "Permission denied"
+# unless the host directory has the correct SELinux context (svirt_sandbox_file_t).
+- name: Create MachineConfig to fix SELinux context for local-path-provisioner
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: MachineConfig
+      metadata:
+        name: 99-local-path-selinux
+        labels:
+          machineconfiguration.openshift.io/role: master
+      spec:
+        config:
+          ignition:
+            version: 3.2.0
+          systemd:
+            units:
+              - name: local-path-selinux.service
+                enabled: true
+                contents: |
+                  [Unit]
+                  Description=Fix SELinux context for local-path-provisioner
+                  Before=kubelet.service
+                  [Service]
+                  Type=oneshot
+                  RemainAfterExit=yes
+                  ExecStart=/bin/mkdir -p {{ local_path_provisioner_path }}
+                  ExecStart=/bin/chcon -Rt svirt_sandbox_file_t {{ local_path_provisioner_path }}
+                  [Install]
+                  WantedBy=multi-user.target
+    state: present
+
+# ── KubeletConfig: raise maxPods ─────────────────────────────────────
+- name: Apply KubeletConfig to raise maxPods to {{ kubelet_max_pods }}
+  kubernetes.core.k8s:
+    kubeconfig: "{{ _storage_kubeconfig }}"
+    definition:
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: KubeletConfig
+      metadata:
+        name: set-max-pods
+      spec:
+        machineConfigPoolSelector:
+          matchLabels:
+            pools.operator.machineconfiguration.openshift.io/master: ""
+        kubeletConfig:
+          maxPods: "{{ kubelet_max_pods | int }}"
+    state: present
+
+# ── Verify ────────────────────────────────────────────────────────────
+# The SELinux MachineConfig and KubeletConfig above may trigger a node reboot
+# via MCO. Wait for MCO to finish before checking deployment readiness.
+- name: Wait for MCO to finish applying configs (node may reboot)
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      OC="{{ oc_bin }} --kubeconfig={{ _storage_kubeconfig }}"
+      for i in $(seq 1 24); do
+        UPDATED=$($OC get mcp master -o jsonpath='{.status.updatedMachineCount}' 2>/dev/null || echo 0)
+        TOTAL=$($OC get mcp master -o jsonpath='{.status.machineCount}' 2>/dev/null || echo 0)
+        DEGRADED=$($OC get mcp master -o jsonpath='{.status.degradedMachineCount}' 2>/dev/null || echo 0)
+        echo "MCO status: updated=$UPDATED total=$TOTAL degraded=$DEGRADED"
+        if [ "$UPDATED" -ge "$TOTAL" ] && [ "$TOTAL" -gt 0 ] && [ "$DEGRADED" -eq 0 ]; then
+          echo "MCO: all nodes updated"
+          exit 0
+        fi
+        sleep 30
+      done
+      echo "MCO: timed out waiting (proceeding anyway)"
+      exit 0
+    executable: /bin/bash
+  register: _storage_mco_wait
+  changed_when: false
+
+- name: Show MCO wait result
+  ansible.builtin.debug:
+    msg: "{{ _storage_mco_wait.stdout_lines[-3:] }}"
+
+- name: Wait for local-path-provisioner deployment to be ready
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ _storage_kubeconfig }}
+      rollout status deployment/local-path-provisioner
+      -n local-path-storage
+      --timeout=10m
+  changed_when: false
+
+- name: Storage setup complete
+  ansible.builtin.debug:
+    msg:
+      - "local-path-provisioner deployed as default StorageClass"
+      - "  StorageClass:  local-path (default)"
+      - "  Binding mode:  Immediate"
+      - "  Host path:     {{ local_path_provisioner_path }}"
+      - "  SELinux fix:   applied via MachineConfig (node restart may take a few minutes)"
+      - "  maxPods:       {{ kubelet_max_pods }} (MCO will restart kubelet)"

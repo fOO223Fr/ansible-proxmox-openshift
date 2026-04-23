@@ -1,0 +1,112 @@
+---
+- name: Destroy OpenShift cluster on Proxmox
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Confirm destruction
+      ansible.builtin.pause:
+        prompt: |-
+          WARNING: This will destroy cluster '{{ cluster_name }}' and all its VMs.
+          The infra VM is NOT affected.
+          Press Ctrl+C to cancel, or Enter to continue
+      when: lookup('env', 'SKIP_CONFIRM') != 'true'
+
+    # ── Read cluster VM list from infra VM ────────────────────────────
+    - name: Add infra VM to inventory
+      ansible.builtin.include_role:
+        name: infra
+        tasks_from: add_to_inventory
+
+    - name: Read clusters.json from infra VM
+      ansible.builtin.slurp:
+        src: /etc/infra/clusters.json
+      delegate_to: infra_host
+      register: _destroy_clusters_raw
+      failed_when: false
+
+    - name: Parse clusters.json
+      ansible.builtin.set_fact:
+        _destroy_clusters: "{{ _destroy_clusters_raw.content | default('e30K') | b64decode | from_json }}"
+
+    - name: Set cluster VM facts from clusters.json
+      ansible.builtin.set_fact:
+        _destroy_cluster_info: "{{ _destroy_clusters.get(cluster_name, {}) }}"
+
+    - name: Build VM list from clusters.json
+      ansible.builtin.set_fact:
+        _destroy_vmids: >-
+          {{ ([_destroy_cluster_info.bootstrap_vmid] if _destroy_cluster_info.bootstrap_vmid is defined else [])
+             + (_destroy_cluster_info.master_vmids | default([]))
+             + (_destroy_cluster_info.worker_vmids | default([])) }}
+      when: _destroy_cluster_info | length > 0
+
+    - name: Set empty VM list if cluster not registered
+      ansible.builtin.set_fact:
+        _destroy_vmids: []
+      when: _destroy_cluster_info | length == 0
+
+    # ── Force-stop and delete VMs ─────────────────────────────────────
+    - name: Force-stop all cluster VMs
+      ansible.builtin.command:
+        cmd: "qm stop {{ item }} --skiplock"
+      loop: "{{ _destroy_vmids }}"
+      delegate_to: proxmox_host
+      changed_when: true
+      failed_when: false
+
+    - name: Wait for VMs to stop
+      ansible.builtin.pause:
+        seconds: 5
+      when: _destroy_vmids | length > 0
+
+    - name: Delete cluster VMs with disk purge
+      ansible.builtin.command:
+        cmd: "qm destroy {{ item }} --purge --skiplock"
+      loop: "{{ _destroy_vmids }}"
+      delegate_to: proxmox_host
+      changed_when: true
+      failed_when: false
+
+    - name: Delete cluster ISOs from Proxmox
+      ansible.builtin.shell:
+        cmd: "rm -f {{ iso_storage_path }}/{{ cluster_name }}-*.iso"
+        executable: /bin/bash
+      delegate_to: proxmox_host
+      changed_when: true
+      failed_when: false
+
+    # ── Deregister from infra VM ──────────────────────────────────────
+    - name: Deregister cluster from infra VM
+      ansible.builtin.include_role:
+        name: infra
+        tasks_from: deregister_cluster
+
+    # ── Clean up local files ──────────────────────────────────────────
+    - name: Remove cluster work directory
+      ansible.builtin.file:
+        path: "{{ cluster_dir }}"
+        state: absent
+
+    - name: Remove cluster kubeconfig from project root
+      ansible.builtin.file:
+        path: "{{ kubeconfig_output }}"
+        state: absent
+
+    - name: Remove cluster kubeadmin password from project root
+      ansible.builtin.file:
+        path: "{{ kubeadmin_output }}"
+        state: absent
+
+    - name: Remove cluster credentials summary from project root
+      ansible.builtin.file:
+        path: "{{ credentials_output }}"
+        state: absent
+
+    - name: Destruction complete
+      ansible.builtin.debug:
+        msg:
+          - "Cluster '{{ cluster_name }}' destroyed"
+          - "  VMs deleted: {{ _destroy_vmids | join(', ') if _destroy_vmids else 'none found' }}"
+          - "  Deregistered from infra VM (DNS, DHCP, HAProxy entries removed)"
+          - "  IPs and VMIDs are now free for future clusters"

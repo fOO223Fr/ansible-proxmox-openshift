@@ -1,0 +1,60 @@
+---
+# ══════════════════════════════════════════════════════════════════════
+# overrides.yml.example — per-cluster configuration reference
+#
+# Copy to overrides.yml and fill in REQUIRED fields.
+# proxmox.yml provides all Proxmox host + infra VM config.
+# overrides.yml contains only what's unique to this cluster.
+# overrides.yml is gitignored.
+# ══════════════════════════════════════════════════════════════════════
+
+# ── CLUSTER IDENTITY [REQUIRED] ───────────────────────────────────────
+cluster_name:               # unique lowercase name (e.g. hub, dr1, prod, blah)
+cluster_base_domain: local.lab
+ocp_version: "4.21.0"
+
+# ── OPENSHIFT CREDENTIALS [REQUIRED] ──────────────────────────────────
+ocp_pull_secret_file: "{{ '~/.tokens/pull-secret.txt' | expanduser }}"
+ocp_ssh_pubkey_file: "{{ '~/.ssh/id_rsa.pub' | expanduser }}"
+
+# ── MASTERS [REQUIRED] ────────────────────────────────────────────────
+# Topology:
+#   SNO (Single Node):  master_count: 1, worker_count: 0
+#   Compact:            master_count: 3, worker_count: 0
+#   Full HA:            master_count: 3, worker_count: 3 (or more)
+master_count: 1
+master_vcpus: 16
+master_memory_mb: 65536
+master_disk_gb: 256
+
+# ── WORKERS [REQUIRED — set count: 0 for SNO or compact] ──────────────
+worker_count: 0
+# worker_vcpus: 8           # required when worker_count > 0
+# worker_memory_mb: 32768   # required when worker_count > 0
+# worker_disk_gb: 120       # required when worker_count > 0
+
+# ── NETWORK CIDRs [OPTIONAL — auto-assigned if omitted] ───────────────
+# Auto-picked from the infra VM's CIDR registry — guaranteed non-overlapping
+# with all other clusters on this host. Set explicitly only when you need a
+# specific range (e.g. Submariner peering, external routing requirements).
+#
+# Auto stagger (per cluster index N):
+#   pod:     10.(128 + N*4).0.0/14   supports up to 32 clusters
+#   service: 172.(30 + N).0.0/16     supports up to 224 clusters
+#
+# cluster_network_cidr: "10.128.0.0/14"
+# service_network_cidr: "172.30.0.0/16"
+
+# ── STORAGE [OPTIONAL] ────────────────────────────────────────────────
+# local-path-provisioner is ALWAYS deployed automatically as the default
+# StorageClass (equivalent to gp3-csi on AWS). No config needed.
+#
+# Uncomment to provision a second raw disk at VM creation time.
+# Use 'make add-disk' instead to hot-add to an already-running cluster.
+# Required if you later want TopoLVM or ODF/Ceph.
+# master_data_disk_gb: 200
+
+# ── TUNING [OPTIONAL] ─────────────────────────────────────────────────
+# maxPods is raised to 500 automatically (SNO default 250 is too low
+# for multi-operator deployments). Override only if needed.
+# kubelet_max_pods: 500

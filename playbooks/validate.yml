@@ -1,0 +1,9 @@
+---
+- name: Validate prerequisites for OpenShift UPI installation
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - ../overrides.yml
+
+  roles:
+    - role: validate

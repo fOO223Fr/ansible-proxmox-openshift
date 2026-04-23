@@ -1,0 +1,150 @@
+---
+# ── Check if infra VM already exists ─────────────────────────────────
+- name: Check if infra VM exists on Proxmox
+  community.proxmox.proxmox_vm_info:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+    vmid: "{{ infra_vmid }}"
+  register: _infra_vm_info
+  failed_when: false
+
+- name: Set infra VM exists fact
+  ansible.builtin.set_fact:
+    _infra_vm_exists: "{{ _infra_vm_info.proxmox_vms | default([]) | length > 0 }}"
+
+- name: Report infra VM already exists
+  ansible.builtin.debug:
+    msg: "Infra VM (VMID {{ infra_vmid }}) already exists — skipping creation"
+  when: _infra_vm_exists
+
+# ── Create infra VM ───────────────────────────────────────────────────
+- name: Create infra VM
+  when: not _infra_vm_exists
+  block:
+    - name: Download Rocky 9 cloud image to Proxmox host
+      ansible.builtin.get_url:
+        url: "{{ rocky_cloud_image_url }}"
+        dest: "{{ rocky_cloud_image_dest }}"
+        mode: '0644'
+      delegate_to: proxmox_host
+
+    - name: Create infra VM via API
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ infra_vmid }}"
+        name: infra
+        cores: "{{ infra_vcpus }}"
+        memory: "{{ infra_memory_mb }}"
+        machine: "{{ vm_machine_type }}"
+        cpu: "{{ vm_cpu_type }}"
+        ostype: l26
+        bios: seabios
+        scsihw: "{{ vm_scsihw }}"
+        agent: 'enabled=1'
+        onboot: true
+        tags: "lab,infra"
+        state: present
+
+    - name: Import Rocky 9 cloud image as boot disk
+      ansible.builtin.command:
+        cmd: "qm importdisk {{ infra_vmid }} {{ rocky_cloud_image_dest }} {{ storage_pool }}"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Attach imported disk as scsi0 (boot disk)
+      ansible.builtin.command:
+        cmd: >-
+          qm set {{ infra_vmid }}
+          --scsi0 {{ storage_pool }}:vm-{{ infra_vmid }}-disk-0,cache=writeback,discard=on,iothread=1
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Resize boot disk to {{ infra_disk_gb }}G
+      ansible.builtin.command:
+        cmd: "qm resize {{ infra_vmid }} scsi0 {{ infra_disk_gb }}G"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Create data disk (scsi1) for registry storage
+      ansible.builtin.command:
+        cmd: >-
+          qm set {{ infra_vmid }}
+          --scsi1 {{ storage_pool }}:{{ infra_data_disk_gb }},cache=writeback,discard=on,iothread=1
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Copy SSH public key to Proxmox for cloud-init
+      ansible.builtin.copy:
+        src: "{{ proxmox_ssh_key }}.pub"
+        dest: /tmp/infra_ssh_key.pub
+        mode: '0644'
+      delegate_to: proxmox_host
+
+    - name: Add cluster bridge NIC (net1 on vmbr1 — internal isolated bridge)
+      ansible.builtin.command:
+        cmd: "qm set {{ infra_vmid }} --net1 virtio,bridge={{ cluster_bridge }},firewall=0"
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Configure cloud-init (network, user, SSH key)
+      ansible.builtin.command:
+        cmd: >-
+          qm set {{ infra_vmid }}
+          --net0 virtio,bridge={{ network_bridge }}{% if network_vlan %},tag={{ network_vlan }}{% endif %},firewall=0
+          --ide2 {{ storage_pool }}:cloudinit
+          --ciuser rocky
+          --sshkeys /tmp/infra_ssh_key.pub
+          --ipconfig0 ip={{ infra_ip }}/{{ vlan_network_cidr.split('/')[1] }},gw={{ network_gateway }}
+          --nameserver {{ network_gateway }}
+          --serial0 socket
+          --vga serial0
+          --boot order=scsi0
+      delegate_to: proxmox_host
+      changed_when: true
+
+    - name: Clean up temporary SSH key file
+      ansible.builtin.file:
+        path: /tmp/infra_ssh_key.pub
+        state: absent
+      delegate_to: proxmox_host
+
+# ── Ensure infra VM is running ────────────────────────────────────────
+- name: Ensure infra VM is started
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ proxmox_api_host }}"
+    api_user: "{{ proxmox_api_user }}"
+    api_token_id: "{{ proxmox_api_token_id }}"
+    api_token_secret: "{{ proxmox_api_token_secret }}"
+    node: "{{ proxmox_node }}"
+    vmid: "{{ infra_vmid }}"
+    state: started
+
+- name: Wait for infra VM to be reachable via SSH
+  ansible.builtin.wait_for:
+    host: "{{ infra_ip }}"
+    port: 22
+    timeout: 300
+    delay: 10
+
+- name: Allow cloud-init to finish
+  ansible.builtin.pause:
+    seconds: 15
+  when: not _infra_vm_exists
+
+# ── Add infra VM to in-memory inventory ──────────────────────────────
+- name: Add infra VM to inventory
+  ansible.builtin.add_host:
+    name: infra_host
+    ansible_host: "{{ infra_ip }}"
+    ansible_user: rocky
+    ansible_ssh_private_key_file: "{{ proxmox_ssh_key }}"
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    ansible_become: true
+    groups: infra

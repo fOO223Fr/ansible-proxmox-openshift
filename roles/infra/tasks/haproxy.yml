@@ -1,0 +1,36 @@
+---
+- name: Install HAProxy
+  ansible.builtin.dnf:
+    name: haproxy
+    state: present
+  delegate_to: infra_host
+
+- name: Read clusters.json from infra VM
+  ansible.builtin.slurp:
+    src: /etc/infra/clusters.json
+  delegate_to: infra_host
+  register: _infra_clusters_raw
+
+- name: Parse clusters.json
+  ansible.builtin.set_fact:
+    _infra_clusters: "{{ _infra_clusters_raw.content | b64decode | from_json }}"
+
+- name: Deploy HAProxy configuration
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: '0644'
+    validate: haproxy -c -f %s
+  vars:
+    clusters: "{{ _infra_clusters }}"
+  delegate_to: infra_host
+  notify: Reload HAProxy
+
+- name: Enable and start HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    enabled: true
+    state: started
+  delegate_to: infra_host

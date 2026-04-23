@@ -1,0 +1,104 @@
+---
+# Build per-node customized RHCOS ISOs directly on the Proxmox host.
+# This avoids transferring 7 x 1.2GB ISOs over SSH. Only the base ISO,
+# coreos-installer binary, and ignition files (~1.2GB total one-time)
+# are sent to Proxmox. Customization runs locally on Proxmox and writes
+# directly to the ISO storage path.
+
+# Build ISO definitions with static IPs baked into kernel args.
+# Static IP eliminates the DHCP race condition between UDM Pro and infra VM dnsmasq.
+# Format: ip=<ip>::<gw>:<mask>:<hostname>::none  +  nameserver=<dns>
+
+- name: Initialize ISO list
+  ansible.builtin.set_fact:
+    _cluster_isos: []
+
+- name: Add bootstrap ISO definition
+  ansible.builtin.set_fact:
+    _cluster_isos: "{{ _cluster_isos + [item] }}"
+  loop:
+    - name: "{{ cluster_name }}-bootstrap.iso"
+      ignition: bootstrap.ign
+      hostname: "{{ cluster_name }}-bootstrap"
+      ip: "{{ bootstrap_ip }}"
+
+- name: Add master ISO definitions
+  ansible.builtin.set_fact:
+    _cluster_isos: "{{ _cluster_isos + [{'name': cluster_name + '-master-' + item | string + '.iso', 'ignition': 'master.ign', 'hostname': cluster_name + '-master-' + item | string, 'ip': master_ips[item | int]}] }}"
+  loop: "{{ range(master_count | int) | list }}"
+
+- name: Add worker ISO definitions
+  ansible.builtin.set_fact:
+    _cluster_isos: "{{ _cluster_isos + [{'name': cluster_name + '-worker-' + item | string + '.iso', 'ignition': 'worker.ign', 'hostname': cluster_name + '-worker-' + item | string, 'ip': worker_ips[item | int]}] }}"
+  loop: "{{ range(worker_count | int) | list }}"
+
+# ── Copy tools and inputs to Proxmox (cached after first run) ─
+- name: Create workspace on Proxmox
+  ansible.builtin.file:
+    path: /tmp/ocp-iso-workspace
+    state: directory
+    mode: '0755'
+  delegate_to: proxmox_host
+
+# ISO is already on Proxmox ISO storage — just symlink it into the workspace
+- name: Link RHCOS ISO into workspace (no copy needed — already on Proxmox)
+  ansible.builtin.file:
+    src: "{{ _cluster_rhcos_proxmox_path }}"
+    dest: /tmp/ocp-iso-workspace/rhcos-live.iso
+    state: link
+    force: true
+  delegate_to: proxmox_host
+
+- name: Copy coreos-installer to Proxmox
+  ansible.builtin.copy:
+    src: "{{ coreos_installer_bin }}"
+    dest: /tmp/ocp-iso-workspace/coreos-installer
+    mode: '0755'
+  delegate_to: proxmox_host
+
+- name: Copy ignition files to Proxmox
+  ansible.builtin.copy:
+    src: "{{ cluster_dir }}/{{ item }}"
+    dest: "/tmp/ocp-iso-workspace/{{ item }}"
+    mode: '0644'
+  loop:
+    - bootstrap.ign
+    - master.ign
+    - worker.ign
+  delegate_to: proxmox_host
+
+# ── Build ISOs directly on Proxmox into ISO storage ──────────
+- name: Build per-node ISOs on Proxmox (DHCP on isolated cluster bridge)
+  ansible.builtin.command:
+    cmd: >-
+      /tmp/ocp-iso-workspace/coreos-installer iso customize
+      --dest-device {{ coreos_install_device }}
+      --dest-ignition /tmp/ocp-iso-workspace/{{ item.ignition }}
+      --live-karg-append "ip=::::{{ item.hostname }}::dhcp"
+      --dest-karg-append "ip=::::{{ item.hostname }}::dhcp"
+      --output {{ iso_storage_path }}/{{ item.name }}
+      /tmp/ocp-iso-workspace/rhcos-live.iso
+  # --live-karg-append: network during the live boot (for MCS contact)
+  # --dest-karg-append: network on the installed system (for running cluster)
+  # No `creates:` — always rebuild so hostname/IP changes per install are applied.
+  changed_when: true
+  loop: "{{ _cluster_isos }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.hostname }}: {{ item.ip }})"
+  delegate_to: proxmox_host
+
+- name: Verify ISOs were created on Proxmox
+  ansible.builtin.stat:
+    path: "{{ iso_storage_path }}/{{ item.name }}"
+  register: _cluster_iso_check
+  loop: "{{ _cluster_isos }}"
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: proxmox_host
+  failed_when: not _cluster_iso_check.stat.exists
+
+- name: ISOs ready on Proxmox
+  ansible.builtin.debug:
+    msg:
+      - "Built {{ _cluster_isos | length }} per-node ISOs directly on Proxmox"
+      - "Each ISO has hostname baked in via kernel args (no DHCP option 12 needed)"
