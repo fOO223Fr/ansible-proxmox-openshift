@@ -26,15 +26,17 @@ vlan_network_cidr: 192.168.1.0/24  # VLAN subnet — used only for infra VM clou
 # ── INFRA VM [REQUIRED] ───────────────────────────────────────────────
 # The permanent shared VM — create once with: make infra
 #
-# BEFORE running make infra on a new host:
-#   1. Create vmbr1 on Proxmox (isolated bridge, no physical NIC):
-#        echo -e "\nauto vmbr1\niface vmbr1 inet manual\n  bridge-ports none\n  bridge-stp off\n  bridge-fd 0" >> /etc/network/interfaces
-#        ifup vmbr1
-#   2. Add net1 on vmbr1 to the infra VM after 'make infra' creates it:
-#        qm set <infra_vmid> --net1 virtio,bridge=vmbr1,firewall=0
-#   3. In Pi-hole (after infra VM is confirmed up):
+# BEFORE running make infra on a new host, only one manual step is needed:
+#   In Pi-hole (after make infra confirms the VM is up):
 #        address=/local.lab/<infra_ip>
 #      This single entry handles DNS for ALL clusters forever.
+#
+# make infra handles the rest automatically:
+#   - Finds the next available vmbrN on the Proxmox host and creates it as an
+#     isolated bridge (bridge-ports none) with a marker comment in
+#     /etc/network/interfaces that matches the style of your existing bridges
+#   - Adds a second NIC on that bridge to the infra VM
+#   - Persists the bridge name at /etc/infra/cluster_bridge for reuse
 #
 # Per-cluster allocation is fully automatic — no DHCP range config needed.
 # Capacity limits per infra VM:
@@ -48,13 +50,20 @@ infra_memory_mb: 4096
 infra_disk_gb: 40                   # Root disk
 infra_data_disk_gb: 200             # Data disk — registry mirror + caches live here
 
-# ── CLUSTER INTERNAL NETWORK [REQUIRED] ───────────────────────────────
-# Cluster VMs connect to vmbr1 (isolated bridge, no physical NIC).
-# Infra VM has a second NIC (eth1) on vmbr1 at infra_cluster_ip/16,
-# NATs cluster VM internet traffic through its VLAN-facing NIC.
-# UDM Pro never sees cluster VM DHCP traffic — no DHCP race condition.
-cluster_bridge: vmbr1
-infra_cluster_ip: "10.0.0.1"         # Infra VM internal gateway IP (eth1 on vmbr1)
+# ── CLUSTER INTERNAL NETWORK ──────────────────────────────────────────
+# Cluster VMs connect to an isolated Linux bridge (no physical NIC).
+# The bridge is auto-discovered on the Proxmox host: the first vmbrN that
+# either has our marker comment or is the next unused number is used.
+# The chosen bridge is persisted on the infra VM at /etc/infra/cluster_bridge.
+#
+# You do NOT need to create the bridge manually or set cluster_bridge here.
+# It is created automatically by 'make infra' with a comment in
+# /etc/network/interfaces matching the style of your existing bridges.
+#
+# If you want to force a specific bridge (e.g. on a host with existing bridges),
+# uncomment and set:
+# cluster_bridge: vmbr2
+infra_cluster_ip: "10.0.0.1"         # Infra VM gateway IP on the internal bridge (eth1)
 
 # ── VMID ALLOCATION POOL [REQUIRED] ───────────────────────────────────
 # Cluster VMIDs (bootstrap, masters, workers) are auto-assigned at

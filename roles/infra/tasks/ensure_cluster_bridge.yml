@@ -1,0 +1,135 @@
+---
+# Discover or create the isolated Linux bridge for cluster VMs on the Proxmox host.
+# The bridge uses bridge-ports none (no physical NIC) — purely a virtual L2 segment.
+#
+# Discovery logic (in priority order):
+#   1. Read /etc/infra/cluster_bridge on the infra VM (persisted from a previous run)
+#   2. Find an existing vmbr with bridge-ports none and our marker comment in
+#      /etc/network/interfaces on the Proxmox host (idempotent if re-running)
+#   3. Find the next unused vmbrN number, create it, and persist the name
+#
+# The chosen bridge name is set as the Ansible fact: cluster_bridge
+
+# ── Step 1: Check if infra VM already recorded the bridge name ───────
+- name: Check if cluster_bridge was previously persisted on infra VM
+  ansible.builtin.slurp:
+    src: /etc/infra/cluster_bridge
+  delegate_to: infra_host
+  register: _bridge_persisted
+  failed_when: false
+
+- name: Use persisted cluster_bridge name
+  ansible.builtin.set_fact:
+    cluster_bridge: "{{ _bridge_persisted.content | b64decode | trim }}"
+  when:
+    - _bridge_persisted.content is defined
+    - (_bridge_persisted.content | b64decode | trim) | length > 0
+
+# ── Step 2: If not persisted, discover or create on Proxmox host ─────
+- name: Discover or create isolated cluster bridge on Proxmox
+  when: cluster_bridge | length == 0
+  block:
+    - name: Find existing isolated bridge or determine next vmbrN
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          NETFILE=/etc/network/interfaces
+          INFRA_VMID="{{ infra_vmid }}"
+
+          # Priority 1: our marker comment (bridges we previously created)
+          EXISTING=$(grep -B20 '#ansible-proxmox-openshift: ocp-internal' "$NETFILE" \
+            | grep -oE '^auto vmbr[0-9]+' | grep -oE 'vmbr[0-9]+' | tail -1)
+          if [ -n "$EXISTING" ]; then
+            echo "BRIDGE=${EXISTING}"
+            echo "ACTION=existing"
+            exit 0
+          fi
+
+          # Priority 2: any vmbr with bridge-ports none that is also connected
+          # to the infra VM — covers bridges created before this automation existed
+          INFRA_BRIDGES=$(qm config "$INFRA_VMID" 2>/dev/null \
+            | grep -oE 'bridge=(vmbr[0-9]+)' | grep -oE 'vmbr[0-9]+')
+          for br in $INFRA_BRIDGES; do
+            # Check if this bridge has bridge-ports none (isolated, not physical)
+            if awk "/^auto ${br}\$/{found=1} found && /bridge-ports none/{print; exit}" \
+                "$NETFILE" | grep -q "bridge-ports none"; then
+              echo "BRIDGE=${br}"
+              echo "ACTION=existing"
+              exit 0
+            fi
+          done
+
+          # Priority 3: any vmbr with bridge-ports none (isolated bridge, likely ours)
+          ISOLATED=$(awk '/^auto vmbr/{bridge=$2} /bridge-ports none/{print bridge; exit}' \
+            "$NETFILE")
+          if [ -n "$ISOLATED" ]; then
+            echo "BRIDGE=${ISOLATED}"
+            echo "ACTION=existing"
+            exit 0
+          fi
+
+          # Priority 4: create the next unused vmbrN
+          USED=$(grep -oE '^auto vmbr[0-9]+' "$NETFILE" | grep -oE '[0-9]+' | sort -n)
+          NEXT=1
+          for used_num in $USED; do
+            if [ "$NEXT" -eq "$used_num" ]; then
+              NEXT=$((NEXT + 1))
+            fi
+          done
+
+          echo "BRIDGE=vmbr${NEXT}"
+          echo "ACTION=create"
+        executable: /bin/bash
+      delegate_to: proxmox_host
+      register: _bridge_discovery
+      changed_when: false
+
+    - name: Parse discovery result
+      ansible.builtin.set_fact:
+        cluster_bridge: "{{ _bridge_discovery.stdout | regex_search('BRIDGE=(vmbr[0-9]+)', '\\1') | first }}"
+        _bridge_action: "{{ _bridge_discovery.stdout | regex_search('ACTION=(\\w+)', '\\1') | first }}"
+
+    - name: Create isolated bridge on Proxmox (append to /etc/network/interfaces)
+      when: _bridge_action == 'create'
+      ansible.builtin.blockinfile:
+        path: /etc/network/interfaces
+        block: |
+          auto {{ cluster_bridge }}
+          iface {{ cluster_bridge }} inet manual
+          	bridge-ports none
+          	bridge-stp off
+          	bridge-fd 0
+          #ansible-proxmox-openshift: ocp-internal
+        marker: "# {mark} OCP INTERNAL BRIDGE {{ cluster_bridge }}"
+        insertbefore: "^source /etc/network/interfaces.d/\\*"
+      delegate_to: proxmox_host
+
+    - name: Bring up the new bridge
+      when: _bridge_action == 'create'
+      ansible.builtin.command:
+        cmd: "ifup {{ cluster_bridge }}"
+      delegate_to: proxmox_host
+      register: _bridge_ifup
+      failed_when: _bridge_ifup.rc != 0 and 'already configured' not in (_bridge_ifup.stderr | default(''))
+      changed_when: _bridge_ifup.rc == 0
+
+    - name: Verify bridge is up
+      ansible.builtin.command:
+        cmd: "ip link show {{ cluster_bridge }}"
+      delegate_to: proxmox_host
+      register: _bridge_verify
+      changed_when: false
+      failed_when: _bridge_verify.rc != 0
+
+    - name: Persist cluster_bridge name on infra VM
+      ansible.builtin.copy:
+        content: "{{ cluster_bridge }}\n"
+        dest: /etc/infra/cluster_bridge
+        owner: root
+        group: root
+        mode: '0644'
+      delegate_to: infra_host
+
+- name: Report cluster bridge
+  ansible.builtin.debug:
+    msg: "Cluster bridge: {{ cluster_bridge }} (cluster VMs will connect here)"

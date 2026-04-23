@@ -1,4 +1,9 @@
 ---
+# Discover or create the isolated cluster bridge before anything else.
+# This sets the cluster_bridge fact used by both VM creation and configuration.
+- name: Discover or create isolated cluster bridge on Proxmox
+  ansible.builtin.include_tasks: ensure_cluster_bridge.yml
+
 - name: Create infra VM if absent
   ansible.builtin.include_tasks: create_vm.yml
 

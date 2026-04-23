@@ -140,11 +140,16 @@
       # bootkube on the bootstrap VM sometimes waits for CVO progress that is itself
       # blocked by the same operators. If the master node is Ready and etcd is healthy,
       # it is safe to manually signal bootstrap completion.
+      #
+      # NOTE: We use grep on the full CO output instead of jsonpath filter
+      # [?(@.type=="Available")] because that filter is unreliable across oc versions
+      # and returns empty silently — causing this condition to never trigger.
       MASTER_READY=$($OC get nodes --no-headers 2>/dev/null | grep -c " Ready" || echo 0)
-      ETCD_OK=$($OC get co etcd -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' \
+      ETCD_CO=$($OC get co etcd -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' \
         2>/dev/null || echo "")
       BOOT_CM_EXISTS=$($OC get cm bootstrap -n kube-system &>/dev/null && echo yes || echo no)
-      if [ "$MASTER_READY" -ge 1 ] && [ "$ETCD_OK" = "True" ] && [ "$BOOT_CM_EXISTS" = "no" ]; then
+      if [ "$MASTER_READY" -ge 1 ] && echo "$ETCD_CO" | grep -q "Available=True" && \
+         [ "$BOOT_CM_EXISTS" = "no" ]; then
         echo "[fix] Master ready and etcd healthy but bootstrap configmap missing."
         echo "[fix] Creating bootstrap configmap to unblock authentication operator."
         $OC create configmap bootstrap -n kube-system --from-literal=status=complete 2>/dev/null && \

@@ -54,6 +54,38 @@
     zone: internal
   delegate_to: infra_host
 
+# Without this policy, firewalld REJECTS inter-zone forwarded packets with
+# "icmpx admin-prohibited" — cluster VMs see "no route to host" and can't
+# reach the internet even though IP forwarding and MASQUERADE are configured.
+- name: Create inter-zone forwarding policy internal → public (cluster VMs → internet)
+  ansible.builtin.command:
+    cmd: "firewall-cmd --permanent --new-policy internal-to-public"
+  delegate_to: infra_host
+  register: _nat_policy_create
+  failed_when: _nat_policy_create.rc != 0 and 'NAME_CONFLICT' not in (_nat_policy_create.stderr | default(''))
+  changed_when: _nat_policy_create.rc == 0
+
+- name: Configure internal-to-public policy ingress zone
+  ansible.builtin.command:
+    cmd: "firewall-cmd --permanent --policy internal-to-public --add-ingress-zone internal"
+  delegate_to: infra_host
+  failed_when: false
+  changed_when: true
+
+- name: Configure internal-to-public policy egress zone
+  ansible.builtin.command:
+    cmd: "firewall-cmd --permanent --policy internal-to-public --add-egress-zone public"
+  delegate_to: infra_host
+  failed_when: false
+  changed_when: true
+
+- name: Set internal-to-public policy target to ACCEPT
+  ansible.builtin.command:
+    cmd: "firewall-cmd --permanent --policy internal-to-public --set-target ACCEPT"
+  delegate_to: infra_host
+  failed_when: false
+  changed_when: true
+
 - name: Allow DHCP on internal zone (cluster VMs need DHCP from infra VM)
   ansible.posix.firewalld:
     zone: internal

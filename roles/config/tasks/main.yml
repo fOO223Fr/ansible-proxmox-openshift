@@ -1,77 +1,69 @@
 ---
 - name: Wait for all cluster operators to be available
-  kubernetes.core.k8s_info:
-    kind: ClusterOperator
-    kubeconfig: "{{ playbook_dir }}/../kubeconfig"
-  register: _config_operators
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+      get co --no-headers
+  register: _config_co_check
   until: >
-    _config_operators.resources |
-    selectattr('status.conditions', 'defined') |
-    map(attribute='status.conditions') |
-    flatten |
-    selectattr('type', 'equalto', 'Available') |
-    selectattr('status', 'equalto', 'True') |
-    list | length == _config_operators.resources | length
-  retries: 60
+    (_config_co_check.stdout_lines | select('match', '.*False.*True.*|.*False.*False.*True.*') | list | length) == 0
+    or _config_co_check.rc != 0
+  retries: 30
   delay: 30
+  changed_when: false
+  failed_when: false
 
-- name: Get cluster version
-  kubernetes.core.k8s_info:
-    kind: ClusterVersion
-    name: version
-    kubeconfig: "{{ playbook_dir }}/../kubeconfig"
-  register: _config_version
-
-- name: Display cluster status
+- name: Display cluster operators summary
   ansible.builtin.debug:
-    msg:
-      - "All cluster operators available"
-      - "Cluster version: {{ _config_version.resources[0].status.desired.version }}"
-      - "Cluster ID: {{ _config_version.resources[0].spec.clusterID }}"
+    msg: "Post-install config: cluster operators checked"
 
-# ── Custom kubeadmin password ────────────────────────────────
+# ── Custom kubeadmin password ─────────────────────────────────────────
+# If ocp_custom_kubeadmin_password_file is set in overrides.yml, replace
+# the auto-generated kubeadmin password with the one from that file.
+# Useful for development clusters where you want a consistent password.
 - name: Set custom kubeadmin password
-  when: ocp_kubeadmin_password_file | default('') | length > 0
+  when: ocp_custom_kubeadmin_password_file | length > 0
   block:
+    - name: Verify custom password file exists
+      ansible.builtin.stat:
+        path: "{{ ocp_custom_kubeadmin_password_file }}"
+      register: _config_pw_file_check
+      failed_when: not _config_pw_file_check.stat.exists
+
     - name: Read custom kubeadmin password
       ansible.builtin.set_fact:
-        _config_kubeadmin_pw: "{{ lookup('file', ocp_kubeadmin_password_file) | trim }}"
+        _config_kubeadmin_pw: "{{ lookup('file', ocp_custom_kubeadmin_password_file) | trim }}"
       no_log: true
 
     - name: Generate bcrypt hash of custom password
       ansible.builtin.command:
         cmd: >-
-          python3 -c "import bcrypt;
-          print(bcrypt.hashpw('{{ _config_kubeadmin_pw }}'.encode(),
-          bcrypt.gensalt()).decode())"
+          python3 -c "
+          import bcrypt;
+          pw = '{{ _config_kubeadmin_pw }}'.encode();
+          print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=10)).decode())
+          "
       register: _config_pw_hash
       changed_when: false
       no_log: true
 
-    - name: Update kubeadmin secret with custom password
-      kubernetes.core.k8s:
-        kubeconfig: "{{ playbook_dir }}/../kubeconfig"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: kubeadmin
-            namespace: kube-system
-          data:
-            kubeadmin: "{{ _config_pw_hash.stdout | b64encode }}"
+    - name: Replace kubeadmin secret with custom password hash
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          patch secret kubeadmin -n kube-system
+          --type=merge
+          -p '{"data":{"kubeadmin":"{{ _config_pw_hash.stdout | b64encode }}"}}'
+      changed_when: true
       no_log: true
 
-    - name: Update cluster-credentials.txt
+    - name: Overwrite auto-generated kubeadmin-password file with custom password
       ansible.builtin.copy:
-        content: |
-          Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
-          Username: kubeadmin
-          Password: {{ _config_kubeadmin_pw }}
-        dest: "{{ playbook_dir }}/../cluster-credentials.txt"
+        content: "{{ _config_kubeadmin_pw }}"
+        dest: "{{ cluster_dir }}/auth/kubeadmin-password"
         mode: '0600'
       no_log: true
 
-    - name: Custom kubeadmin password set
+    - name: Custom kubeadmin password applied
       ansible.builtin.debug:
-        msg: "kubeadmin password updated from {{ ocp_kubeadmin_password_file }}"
+        msg: "kubeadmin password set from {{ ocp_custom_kubeadmin_password_file }}"

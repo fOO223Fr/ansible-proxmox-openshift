@@ -40,17 +40,18 @@ This project brings the same experience to Proxmox. One config file per cluster
 │               quay.io/:5001, registry.redhat.io/:5002        │
 │               docker.io/:5003, registry.k8s.io/:5004         │
 └──────────────────────┬──────────────────────────────────────┘
-                       │ vmbr1 (isolated Linux bridge)
+                       │ vmbrN (isolated Linux bridge, auto-created by make infra)
           ┌────────────┼────────────┐
           │            │            │
      hub-master-0  dr1-master-0  dr2-master-0
      10.0.1.11     10.0.2.11     10.0.3.11
 ```
 
-Cluster VMs connect to an **isolated Linux bridge** (`vmbr1`) with no physical
-NIC. The infra VM NATs their internet traffic through the physical VLAN.
-The infra VM's dnsmasq is the only DHCP server — no DHCP race condition with
-the router.
+Cluster VMs connect to an **isolated Linux bridge** (auto-discovered or created
+by `make infra` — no manual setup needed) with no physical NIC. The bridge name
+is persisted on the infra VM and reused across installs. The infra VM NATs
+their internet traffic through the physical VLAN. The infra VM's dnsmasq is the
+only DHCP server — no DHCP race condition with the router.
 
 ### What gets auto-allocated per cluster
 
@@ -70,15 +71,11 @@ the router.
 - **Proxmox VE** (tested on 7.x and 8.x) with:
   - API token for the `ansible` user
   - SSH access from the Ansible controller
-  - An isolated Linux bridge `vmbr1` (no physical NIC):
-    ```
-    # Add to /etc/network/interfaces on Proxmox host, then: ifup vmbr1
-    auto vmbr1
-    iface vmbr1 inet manual
-        bridge-ports none
-        bridge-stp off
-        bridge-fd 0
-    ```
+  - **No manual bridge setup needed** — `make infra` automatically finds the
+    next unused `vmbrN` on the Proxmox host and creates it as an isolated
+    internal bridge for cluster VMs. The bridge is added to
+    `/etc/network/interfaces` with a comment matching your existing interface
+    style and persisted for reuse.
 - **OpenShift pull secret** from [console.redhat.com](https://console.redhat.com/openshift/install/pull-secret)
 - **DNS** — add one forwarding rule in your DNS server (Pi-hole, Adguard, etc.):
   ```
@@ -152,8 +149,10 @@ infra_memory_mb: 4096
 infra_disk_gb: 40                  # Root disk
 infra_data_disk_gb: 200            # Registry data disk
 
-cluster_bridge: vmbr1              # Isolated bridge for cluster VMs
-infra_cluster_ip: "10.0.0.1"      # Infra VM's IP on vmbr1 (cluster gateway)
+# cluster_bridge is NOT required — make infra auto-discovers or creates the
+# next available vmbrN on the Proxmox host and persists the choice.
+# Uncomment only to force a specific bridge: cluster_bridge: vmbr2
+infra_cluster_ip: "10.0.0.1"      # Infra VM's IP on the auto-created cluster bridge
 
 vmid_pool_start: 200               # Cluster VMIDs auto-allocated from this range
 vmid_pool_end: 999

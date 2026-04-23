@@ -17,6 +17,13 @@ ocp_version: "4.21.0"
 ocp_pull_secret_file: "{{ '~/.tokens/pull-secret.txt' | expanduser }}"
 ocp_ssh_pubkey_file: "{{ '~/.ssh/id_rsa.pub' | expanduser }}"
 
+# ── CUSTOM KUBEADMIN PASSWORD [OPTIONAL] ──────────────────────────────
+# If set, the auto-generated kubeadmin password is replaced with the one
+# in this file after install. Useful for development clusters where you
+# want a consistent, memorable password across reinstalls.
+# The file should contain the plaintext password (no trailing newline needed).
+# ocp_custom_kubeadmin_password_file: "{{ '~/.tokens/kubepasswd' | expanduser }}"
+
 # ── MASTERS [REQUIRED] ────────────────────────────────────────────────
 # Topology:
 #   SNO (Single Node):  master_count: 1, worker_count: 0

@@ -65,14 +65,20 @@ ansible-proxmox-openshift/
 ### Shared Infra VM
 A single permanent Rocky Linux 9 VM (not destroyed between installs) provides:
 - **HAProxy** — SNI-based TCP passthrough routing for API (:6443), ingress (:443/:80), MCS (:22623)
-- **dnsmasq** — DNS + DHCP for the isolated cluster bridge (vmbr1)
+- **dnsmasq** — DNS + DHCP for the auto-created isolated cluster bridge
 - **iptables NAT** — cluster VMs use the infra VM as their internet gateway
 - **OCP registry** — mirror (port 5000) + pull-through caches (5001–5004)
 
 State is tracked in `/etc/infra/clusters.json` on the infra VM.
 
-### Isolated Cluster Bridge (vmbr1)
-Cluster VMs connect to an isolated Linux bridge (`vmbr1`) with no physical NIC.
+### Isolated Cluster Bridge (auto-discovered vmbrN)
+`make infra` automatically finds the next unused `vmbrN` on the Proxmox host
+(or reuses an existing isolated bridge it previously created), adds it to
+`/etc/network/interfaces` with a `#ansible-proxmox-openshift: ocp-internal`
+marker comment matching the style of existing bridges, and persists the chosen
+name at `/etc/infra/cluster_bridge` on the infra VM for reuse.
+
+Cluster VMs connect to this bridge (no physical NIC — isolated L2 segment).
 The infra VM bridges this to the physical VLAN via NAT.
 Benefits:
 - Infra VM's dnsmasq is the **only** DHCP server — no race condition with router

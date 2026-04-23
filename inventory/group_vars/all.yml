@@ -27,7 +27,11 @@ network_rate_limit: 0
 network_gateway: ""
 vlan_network_cidr: ""  # Set in proxmox.yml — the infra VM's VLAN subnet (e.g. 172.16.29.0/24)
                        # This is NOT the cluster machine network (that is 10.0.N.0/24, auto-allocated per cluster)
-cluster_bridge: vmbr1       # Isolated internal bridge for cluster VMs (set in proxmox.yml)
+# cluster_bridge: auto-discovered by ensure_cluster_bridge.yml on each run.
+# The first vmbrN with our marker comment (or next unused vmbrN) is used.
+# Persisted at /etc/infra/cluster_bridge on the infra VM for reuse.
+# Override in proxmox.yml only if you need a specific bridge.
+cluster_bridge: ""  # empty = auto-discover (set by ensure_cluster_bridge.yml)
 # Per-cluster machine network: 10.0.<N>.0/24 — auto-allocated by allocate.yml
 # Per-cluster pod CIDR:        10.(128+N*4).0.0/14 — auto-staggered
 # Per-cluster service CIDR:    172.(30+N).0.0/16 — auto-staggered
@@ -41,6 +45,7 @@ ocp_version: "4.21.0"
 # ── OpenShift Credentials (set in overrides.yml) ─────────────
 ocp_pull_secret_file: "{{ '~/.tokens/pull-secret.txt' | expanduser }}"
 ocp_ssh_pubkey_file: "{{ '~/.ssh/id_rsa.pub' | expanduser }}"
+ocp_custom_kubeadmin_password_file: ""  # optional: replace auto-generated kubeadmin password
 
 # ── Bootstrap Node (temporary — deleted after install) ───────
 bootstrap_vcpus: 8
