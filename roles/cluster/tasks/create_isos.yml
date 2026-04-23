@@ -1,38 +1,11 @@
 ---
-# Build per-node customized RHCOS ISOs directly on the Proxmox host.
-# This avoids transferring 7 x 1.2GB ISOs over SSH. Only the base ISO,
-# coreos-installer binary, and ignition files (~1.2GB total one-time)
-# are sent to Proxmox. Customization runs locally on Proxmox and writes
-# directly to the ISO storage path.
+# ── ISO creation ──────────────────────────────────────────────────────────────
+# SNO/BIP: ONE iso with the merged ignition embedded (iso ignition embed).
+#          The node boots, installs RHCOS to disk, reboots as a full cluster.
+# UPI:     Per-node ISOs built with coreos-installer iso customize.
+#          Each node has its own iso with hostname + DHCP kernel args baked in.
 
-# Build ISO definitions with static IPs baked into kernel args.
-# Static IP eliminates the DHCP race condition between UDM Pro and infra VM dnsmasq.
-# Format: ip=<ip>::<gw>:<mask>:<hostname>::none  +  nameserver=<dns>
-
-- name: Initialize ISO list
-  ansible.builtin.set_fact:
-    _cluster_isos: []
-
-- name: Add bootstrap ISO definition
-  ansible.builtin.set_fact:
-    _cluster_isos: "{{ _cluster_isos + [item] }}"
-  loop:
-    - name: "{{ cluster_name }}-bootstrap.iso"
-      ignition: bootstrap.ign
-      hostname: "{{ cluster_name }}-bootstrap"
-      ip: "{{ bootstrap_ip }}"
-
-- name: Add master ISO definitions
-  ansible.builtin.set_fact:
-    _cluster_isos: "{{ _cluster_isos + [{'name': cluster_name + '-master-' + item | string + '.iso', 'ignition': 'master.ign', 'hostname': cluster_name + '-master-' + item | string, 'ip': master_ips[item | int]}] }}"
-  loop: "{{ range(master_count | int) | list }}"
-
-- name: Add worker ISO definitions
-  ansible.builtin.set_fact:
-    _cluster_isos: "{{ _cluster_isos + [{'name': cluster_name + '-worker-' + item | string + '.iso', 'ignition': 'worker.ign', 'hostname': cluster_name + '-worker-' + item | string, 'ip': worker_ips[item | int]}] }}"
-  loop: "{{ range(worker_count | int) | list }}"
-
-# ── Copy tools and inputs to Proxmox (cached after first run) ─
+# ── Setup: workspace on Proxmox ───────────────────────────────────────────────
 - name: Create workspace on Proxmox
   ansible.builtin.file:
     path: /tmp/ocp-iso-workspace
@@ -40,8 +13,7 @@
     mode: '0755'
   delegate_to: proxmox_host
 
-# ISO is already on Proxmox ISO storage — just symlink it into the workspace
-- name: Link RHCOS ISO into workspace (no copy needed — already on Proxmox)
+- name: Link RHCOS ISO into workspace (already cached on Proxmox)
   ansible.builtin.file:
     src: "{{ _cluster_rhcos_proxmox_path }}"
     dest: /tmp/ocp-iso-workspace/rhcos-live.iso
@@ -49,14 +21,52 @@
     force: true
   delegate_to: proxmox_host
 
-- name: Copy coreos-installer to Proxmox
+# ── SNO / Bootstrap-In-Place path ─────────────────────────────────────────────
+- name: "[SNO/BIP] Copy single-node ignition to Proxmox"
+  when: _cluster_is_sno
+  ansible.builtin.copy:
+    src: "{{ cluster_dir }}/bootstrap-in-place-for-live-iso.ign"
+    dest: /tmp/ocp-iso-workspace/bootstrap-in-place-for-live-iso.ign
+    mode: '0644'
+  delegate_to: proxmox_host
+
+- name: "[SNO/BIP] Build single master ISO (iso ignition embed)"
+  when: _cluster_is_sno
+  ansible.builtin.command:
+    cmd: >-
+      /tmp/ocp-iso-workspace/coreos-installer iso ignition embed
+      -fi /tmp/ocp-iso-workspace/bootstrap-in-place-for-live-iso.ign
+      --output {{ iso_storage_path }}/{{ cluster_name }}-master-0.iso
+      /tmp/ocp-iso-workspace/rhcos-live.iso
+  delegate_to: proxmox_host
+  changed_when: true
+
+- name: "[SNO/BIP] Verify master ISO was created"
+  when: _cluster_is_sno
+  ansible.builtin.stat:
+    path: "{{ iso_storage_path }}/{{ cluster_name }}-master-0.iso"
+  delegate_to: proxmox_host
+  register: _cluster_sno_iso_check
+  failed_when: not _cluster_sno_iso_check.stat.exists
+
+- name: "[SNO/BIP] ISO ready"
+  when: _cluster_is_sno
+  ansible.builtin.debug:
+    msg:
+      - "SNO Bootstrap-In-Place ISO: {{ iso_storage_path }}/{{ cluster_name }}-master-0.iso"
+      - "The master node will boot, install RHCOS to {{ coreos_install_device }}, and reboot as the cluster"
+
+# ── UPI (multi-node) path ─────────────────────────────────────────────────────
+- name: "[UPI] Copy coreos-installer to Proxmox"
+  when: not _cluster_is_sno
   ansible.builtin.copy:
     src: "{{ coreos_installer_bin }}"
     dest: /tmp/ocp-iso-workspace/coreos-installer
     mode: '0755'
   delegate_to: proxmox_host
 
-- name: Copy ignition files to Proxmox
+- name: "[UPI] Copy ignition files to Proxmox"
+  when: not _cluster_is_sno
   ansible.builtin.copy:
     src: "{{ cluster_dir }}/{{ item }}"
     dest: "/tmp/ocp-iso-workspace/{{ item }}"
@@ -67,8 +77,46 @@
     - worker.ign
   delegate_to: proxmox_host
 
-# ── Build ISOs directly on Proxmox into ISO storage ──────────
-- name: Build per-node ISOs on Proxmox (DHCP on isolated cluster bridge)
+- name: "[UPI] Derive netmask from machine_network_cidr prefix"
+  when: not _cluster_is_sno
+  ansible.builtin.set_fact:
+    _iso_netmask: "{{ _prefix_to_mask[cluster_machine_cidr.split('/')[1]] | default('255.255.255.0') }}"
+  vars:
+    _prefix_to_mask:
+      '8': '255.0.0.0'
+      '16': '255.255.0.0'
+      '24': '255.255.255.0'
+      '25': '255.255.255.128'
+
+- name: "[UPI] Define per-node ISOs"
+  when: not _cluster_is_sno
+  ansible.builtin.set_fact:
+    _cluster_isos: []
+
+- name: "[UPI] Add bootstrap ISO definition"
+  when: not _cluster_is_sno
+  ansible.builtin.set_fact:
+    _cluster_isos: "{{ _cluster_isos + [item] }}"
+  loop:
+    - name: "{{ cluster_name }}-bootstrap.iso"
+      ignition: bootstrap.ign
+      hostname: "{{ cluster_name }}-bootstrap"
+      ip: "{{ bootstrap_ip }}"
+
+- name: "[UPI] Add master ISO definitions"
+  when: not _cluster_is_sno
+  ansible.builtin.set_fact:
+    _cluster_isos: "{{ _cluster_isos + [{'name': cluster_name + '-master-' + item | string + '.iso', 'ignition': 'master.ign', 'hostname': cluster_name + '-master-' + item | string, 'ip': master_ips[item | int]}] }}"
+  loop: "{{ range(master_count | int) | list }}"
+
+- name: "[UPI] Add worker ISO definitions"
+  when: not _cluster_is_sno
+  ansible.builtin.set_fact:
+    _cluster_isos: "{{ _cluster_isos + [{'name': cluster_name + '-worker-' + item | string + '.iso', 'ignition': 'worker.ign', 'hostname': cluster_name + '-worker-' + item | string, 'ip': worker_ips[item | int]}] }}"
+  loop: "{{ range(worker_count | int) | list }}"
+
+- name: "[UPI] Build per-node ISOs on Proxmox (DHCP on isolated cluster bridge)"
+  when: not _cluster_is_sno
   ansible.builtin.command:
     cmd: >-
       /tmp/ocp-iso-workspace/coreos-installer iso customize
@@ -78,16 +126,14 @@
       --dest-karg-append "ip=::::{{ item.hostname }}::dhcp"
       --output {{ iso_storage_path }}/{{ item.name }}
       /tmp/ocp-iso-workspace/rhcos-live.iso
-  # --live-karg-append: network during the live boot (for MCS contact)
-  # --dest-karg-append: network on the installed system (for running cluster)
-  # No `creates:` — always rebuild so hostname/IP changes per install are applied.
-  changed_when: true
   loop: "{{ _cluster_isos }}"
   loop_control:
     label: "{{ item.name }} ({{ item.hostname }}: {{ item.ip }})"
   delegate_to: proxmox_host
+  changed_when: true
 
-- name: Verify ISOs were created on Proxmox
+- name: "[UPI] Verify per-node ISOs were created"
+  when: not _cluster_is_sno
   ansible.builtin.stat:
     path: "{{ iso_storage_path }}/{{ item.name }}"
   register: _cluster_iso_check
@@ -96,9 +142,3 @@
     label: "{{ item.name }}"
   delegate_to: proxmox_host
   failed_when: not _cluster_iso_check.stat.exists
-
-- name: ISOs ready on Proxmox
-  ansible.builtin.debug:
-    msg:
-      - "Built {{ _cluster_isos | length }} per-node ISOs directly on Proxmox"
-      - "Each ISO has hostname baked in via kernel args (no DHCP option 12 needed)"

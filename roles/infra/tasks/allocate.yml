@@ -71,9 +71,14 @@
     _alloc_cluster_dns: "{{ infra_cluster_ip }}"
 
 # ── Allocate IPs within the cluster's /24 ────────────────────────────
+# BIP (SNO): no bootstrap IP — only master + worker IPs needed
+# UPI:       bootstrap + masters + workers
 - name: Calculate number of IPs needed
   ansible.builtin.set_fact:
-    _alloc_ip_count: "{{ 1 + (master_count | int) + (worker_count | int) }}"
+    _alloc_ip_count: >-
+      {{ (master_count | int) + (worker_count | int)
+         if (_cluster_is_sno | default(false) | bool)
+         else 1 + (master_count | int) + (worker_count | int) }}
 
 - name: Generate IP list for this cluster's /24 (10.0.<N>.10–249)
   ansible.builtin.set_fact:
@@ -92,9 +97,17 @@
 
 - name: Assign IPs to bootstrap, masters, and workers
   ansible.builtin.set_fact:
-    _alloc_bootstrap_ip: "{{ _alloc_free_ips[0] }}"
-    _alloc_master_ips: "{{ _alloc_free_ips[1: 1 + master_count | int] }}"
-    _alloc_worker_ips: "{{ _alloc_free_ips[1 + master_count | int:] }}"
+    # BIP (SNO): no bootstrap IP — masters start from index 0
+    # UPI:       bootstrap at index 0, masters from index 1
+    _alloc_bootstrap_ip: "{{ _alloc_free_ips[0] if not (_cluster_is_sno | default(false) | bool) else '' }}"
+    _alloc_master_ips: >-
+      {{ _alloc_free_ips[0: master_count | int]
+         if (_cluster_is_sno | default(false) | bool)
+         else _alloc_free_ips[1: 1 + master_count | int] }}
+    _alloc_worker_ips: >-
+      {{ _alloc_free_ips[master_count | int:]
+         if (_cluster_is_sno | default(false) | bool)
+         else _alloc_free_ips[1 + master_count | int:] }}
 
 # ── Generate deterministic MACs ───────────────────────────────────────
 # Format: 52:54:<cluster_byte>:<role_byte>:<index_byte>:00
@@ -104,9 +117,9 @@
   ansible.builtin.set_fact:
     _alloc_cluster_byte: "{{ (cluster_name | hash('md5'))[0:2] }}"
 
-- name: Set bootstrap MAC
+- name: Set bootstrap MAC (empty for BIP/SNO, set for UPI)
   ansible.builtin.set_fact:
-    _alloc_bootstrap_mac: "52:54:{{ _alloc_cluster_byte }}:00:00:00"
+    _alloc_bootstrap_mac: "{{ '52:54:' + _alloc_cluster_byte + ':00:00:00' if not (_cluster_is_sno | default(false) | bool) else '' }}"
 
 - name: Initialize master and worker MAC lists
   ansible.builtin.set_fact:
@@ -158,9 +171,17 @@
 
 - name: Assign VMIDs to bootstrap, masters, and workers
   ansible.builtin.set_fact:
-    _alloc_bootstrap_vmid: "{{ _alloc_free_vmids[0] | int }}"
-    _alloc_master_vmids: "{{ _alloc_free_vmids[1: 1 + master_count | int] | map('int') | list }}"
-    _alloc_worker_vmids: "{{ _alloc_free_vmids[1 + master_count | int:] | map('int') | list }}"
+    # BIP (SNO): no bootstrap VMID
+    # UPI:       bootstrap at index 0, masters from index 1
+    _alloc_bootstrap_vmid: "{{ _alloc_free_vmids[0] | int if not (_cluster_is_sno | default(false) | bool) else 0 }}"
+    _alloc_master_vmids: >-
+      {{ _alloc_free_vmids[0: master_count | int] | map('int') | list
+         if (_cluster_is_sno | default(false) | bool)
+         else _alloc_free_vmids[1: 1 + master_count | int] | map('int') | list }}
+    _alloc_worker_vmids: >-
+      {{ _alloc_free_vmids[master_count | int:] | map('int') | list
+         if (_cluster_is_sno | default(false) | bool)
+         else _alloc_free_vmids[1 + master_count | int:] | map('int') | list }}
 
 # ── Allocate pod/service CIDRs ────────────────────────────────────────
 - name: Collect CIDRs already in use by registered clusters
@@ -239,12 +260,11 @@
 
 - name: "Show allocations for cluster '{{ cluster_name }}'"
   ansible.builtin.debug:
-    msg:
-      - "Bootstrap:       VMID={{ bootstrap_vmid }}  IP={{ bootstrap_ip }}  MAC={{ bootstrap_mac }}"
-      - "Masters:         VMIDs={{ master_vmids }}"
-      - "                 IPs={{ master_ips }}"
-      - "                 MACs={{ master_macs }}"
-      - "Workers:         VMIDs={{ worker_vmids }}  IPs={{ worker_ips }}  MACs={{ worker_macs }}"
-      - "Machine network: {{ cluster_machine_cidr }} (gateway: {{ cluster_gateway }}, dns: {{ cluster_dns }})"
-      - "Pod CIDR:        {{ cluster_network_cidr }}"
-      - "Svc CIDR:        {{ service_network_cidr }}"
+    msg: >-
+      {{ (['Mode: ' + ('SNO Bootstrap-In-Place (no bootstrap VM)' if _cluster_is_sno else 'UPI (bootstrap VM)')] +
+          (['Bootstrap: VMID=' + bootstrap_vmid | string + '  IP=' + bootstrap_ip + '  MAC=' + bootstrap_mac] if not _cluster_is_sno else []) +
+          ['Masters:   VMIDs=' + master_vmids | string + '  IPs=' + master_ips | string] +
+          ['Workers:   VMIDs=' + worker_vmids | string + '  IPs=' + worker_ips | string] +
+          ['Machine:   ' + cluster_machine_cidr + ' (gw: ' + cluster_gateway + ', dns: ' + cluster_dns + ')'] +
+          ['Pod CIDR:  ' + cluster_network_cidr] +
+          ['Svc CIDR:  ' + service_network_cidr]) }}

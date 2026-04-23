@@ -1,10 +1,11 @@
 ---
 # VMIDs, IPs, and MACs are set as facts by register_cluster (allocate.yml).
-# This task just creates the VMs using those facts.
+# SNO/BIP: only the master VM is created (no bootstrap VM).
+# UPI:     bootstrap VM + master VMs + worker VMs.
 
 - name: Build VM definitions for all cluster nodes
   ansible.builtin.set_fact:
-    _cluster_vms: "{{ [bootstrap_def] + master_defs + worker_defs }}"
+    _cluster_vms: "{{ ([] if _cluster_is_sno else [bootstrap_def]) + master_defs + worker_defs }}"
   vars:
     bootstrap_def:
       name: "{{ cluster_name }}-bootstrap"
@@ -26,7 +27,7 @@
         'memory': master_memory_mb,
         'disk_gb': master_disk_gb,
         'mac': master_macs[i],
-        'iso': cluster_name + '-master-' + i | string + '.iso'
+        'iso': (cluster_name + '-master-0.iso') if (_cluster_is_sno | bool) else (cluster_name + '-master-' + i | string + '.iso')
       }) -%}
       {% endfor -%}
       {{ nodes }}
@@ -202,8 +203,8 @@
 
 - name: VMs created successfully
   ansible.builtin.debug:
-    msg:
-      - "Created {{ _cluster_vms | length }} VMs on Proxmox:"
-      - "  Bootstrap:  VMID={{ bootstrap_vmid }}  IP={{ bootstrap_ip }}"
-      - "  Masters:    VMIDs={{ master_vmids }}  IPs={{ master_ips }}"
-      - "  Workers:    VMIDs={{ worker_vmids }}  IPs={{ worker_ips }}"
+    msg: >-
+      {{ ['Created ' + (_cluster_vms | length | string) + ' VMs on Proxmox (' + ('SNO/BIP' if _cluster_is_sno else 'UPI') + '):'] +
+         (['  Bootstrap:  VMID=' + bootstrap_vmid | string + '  IP=' + bootstrap_ip] if not _cluster_is_sno else []) +
+         ['  Masters:    VMIDs=' + master_vmids | string + '  IPs=' + master_ips | string] +
+         (['  Workers:    VMIDs=' + worker_vmids | string + '  IPs=' + worker_ips | string] if worker_count | int > 0 else []) }}

@@ -333,24 +333,41 @@ hub-cluster-credentials.txt # Summary: console URL, API, username, password
 
 ### Install Flow
 
+The install mode is selected automatically based on the cluster topology:
+
+**SNO (`master_count: 1`) → Bootstrap-In-Place (BIP)** — official Red Hat SNO method.
+No separate bootstrap VM. The single node boots the live ISO, installs RHCOS
+directly to disk, and reboots as a fully running cluster.
+
+**Multi-node (`master_count: 3+`) → UPI** — standard bare-metal UPI with a
+temporary bootstrap VM that the master nodes contact for their ignition configs.
+
 ```
 make install
   │
-  ├── Check infra VM exists on Proxmox (fail if not: run make infra first)
+  ├── Detect install mode: SNO=BIP or multi-node=UPI
+  ├── Check infra VM exists (fail if not: run make infra first)
   ├── register_cluster → allocate VMIDs, IPs, MACs, pod/service/machine CIDRs
-  │   └── writes /etc/infra/clusters.json on infra VM
-  │   └── adds dnsmasq DHCP reservations + DNS wildcard
-  │   └── adds HAProxy SNI backends
-  ├── Download OCP tools (cached in tmp/tools/<version>/)
-  ├── Download RHCOS ISO → cached on Proxmox ISO storage
-  ├── Generate ignition configs (openshift-install)
-  ├── Build per-node ISOs (DHCP hostname baked in)
-  ├── Create VMs on Proxmox (VMIDs, MACs from allocation)
-  ├── Boot VMs and monitor bootstrap (up to 150 minutes)
-  │   └── Auto-applies OCP 4.21+ audit-0 workaround when API comes up
-  │   └── Auto-creates missing APIServices to break CVO deadlock
-  │   └── Auto-forces bootstrap complete if master is ready but bootkube is stuck
-  ├── Delete bootstrap VM after handoff
+  │   SNO: allocates master only (no bootstrap VM/IP/MAC)
+  │   UPI: allocates bootstrap + masters + workers
+  ├── Download OCP tools + RHCOS ISO (cached)
+  │
+  ├── [SNO/BIP] openshift-install create single-node-ignition-config
+  │            → bootstrap-in-place-for-live-iso.ign (merged bootstrap+master)
+  │   [UPI]    openshift-install create ignition-configs
+  │            → bootstrap.ign + master.ign + worker.ign
+  │
+  ├── [SNO/BIP] coreos-installer iso ignition embed → ONE iso for master
+  │   [UPI]    coreos-installer iso customize → per-node ISOs with DHCP
+  │
+  ├── Create VMs: [SNO] master only | [UPI] bootstrap + masters + workers
+  │
+  ├── [SNO/BIP] openshift-install wait-for install-complete (up to 90 min)
+  │            Node reboots automatically after writing RHCOS to disk
+  │   [UPI]    Monitor bootstrap (up to 150 min)
+  │            Auto-applies OCP 4.21+ audit-0 + APIService + bootstrap fixes
+  │            Delete bootstrap VM after handoff
+  │
   ├── Post-install day-2 config
   ├── Save credentials to project root
   └── Deploy local-path-provisioner as default StorageClass
@@ -386,6 +403,8 @@ interprets this as an incomplete version transition and blocks indefinitely, cre
 a circular dependency with the CVO.
 
 **This project automatically works around it** in `monitor_bootstrap_tick.yml`:
+(Note: SNO installs use Bootstrap-In-Place which has fewer kube-apiserver
+revision rollovers, reducing the window for this race condition to occur.)
 - Creates `audit-0` from `audit-1` once the cluster API is reachable
 - Clears the `revision-status-1.reason` field
 - Creates missing OpenShift APIServices to break the CVO deadlock

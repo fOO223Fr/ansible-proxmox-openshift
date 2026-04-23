@@ -6,7 +6,7 @@
     state: restarted
   delegate_to: infra_host
 
-# ── Start all VMs ────────────────────────────────────────────
+# ── Start all VMs ─────────────────────────────────────────────
 - name: Start all cluster VMs
   community.proxmox.proxmox_kvm:
     api_host: "{{ proxmox_api_host }}"
@@ -20,21 +20,56 @@
   loop_control:
     label: "{{ item.name }}"
 
-- name: All VMs booting
-  ansible.builtin.debug:
-    msg: |-
-      All {{ _cluster_vms | length }} VMs started. Monitoring bootstrap progress...
+# ══════════════════════════════════════════════════════════════
+# SNO / Bootstrap-In-Place
+# The single node boots the live ISO, installs RHCOS to disk,
+# reboots, and comes up as a fully running cluster.
+# No separate bootstrap VM. No BOOTSTRAP_SAFE check.
+# We monitor directly with openshift-install wait-for install-complete.
+# ══════════════════════════════════════════════════════════════
+- name: "[SNO/BIP] Wait for install to complete (up to 90 min)"
+  when: _cluster_is_sno
+  block:
+    - name: "[SNO/BIP] Wait for API to become available"
+      ansible.builtin.wait_for:
+        host: "api.{{ cluster_name }}.{{ cluster_base_domain }}"
+        port: 6443
+        timeout: 1800
+        delay: 60
+
+    - name: "[SNO/BIP] Wait for install-complete"
+      ansible.builtin.command:
+        cmd: >-
+          {{ openshift_install_bin }} wait-for install-complete
+          --dir={{ cluster_dir }}
+          --log-level=info
+      register: _sno_install_complete
+      async: 5400
+      poll: 60
+      changed_when: true
+      retries: 2
+      delay: 30
+      until: _sno_install_complete.rc == 0
+
+    - name: "[SNO/BIP] Installation complete"
+      ansible.builtin.debug:
+        msg:
+          - "SNO Bootstrap-In-Place installation complete"
+          - "API: https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443"
+          - "Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}"
 
 # ══════════════════════════════════════════════════════════════
-# Bootstrap monitoring — polls every 30s with live progress
+# UPI (multi-node) bootstrap monitoring — polls every 30s with live progress
 # Only deletes bootstrap when configmap=complete AND etcd
 # bootstrap member is removed.
 # ══════════════════════════════════════════════════════════════
-- name: Initialize bootstrap tracking
+- name: "[UPI] Initialize bootstrap tracking"
+  when: not _cluster_is_sno
   ansible.builtin.set_fact:
     cluster_bootstrap_safe: false
 
-- name: Monitor bootstrap progress (up to 150 min)
+- name: "[UPI] Monitor bootstrap progress (up to 150 min)"
+  when: not _cluster_is_sno
   ansible.builtin.include_tasks: monitor_bootstrap_tick.yml
   loop: "{{ range(30) | list }}"
   loop_control:
@@ -42,8 +77,10 @@
     label: "tick {{ _tick }}"
   when: not cluster_bootstrap_safe
 
-- name: Bootstrap timed out
-  when: not cluster_bootstrap_safe
+- name: "[UPI] Bootstrap timed out"
+  when:
+    - not _cluster_is_sno
+    - not cluster_bootstrap_safe
   block:
     - name: Collect diagnostic info  # noqa: risky-shell-pipe
       ansible.builtin.shell:
@@ -56,9 +93,6 @@
           echo "=== CLUSTER OPERATORS ==="
           {{ oc_bin }} get co 2>&1 || echo "(API unreachable)"
           echo ""
-          echo "=== ETCD PODS ==="
-          {{ oc_bin }} get pods -n openshift-etcd --no-headers 2>&1 || echo "(API unreachable)"
-          echo ""
           echo "=== BOOTSTRAP CONFIGMAP ==="
           {{ oc_bin }} get cm bootstrap -n kube-system -o yaml 2>&1 || echo "(not found)"
         executable: /bin/bash
@@ -68,20 +102,21 @@
 
     - name: Show diagnostics
       ansible.builtin.debug:
-        msg: "{{ _cluster_diag.stdout }}"
+        msg: "{{ _cluster_diag.stdout_lines }}"
 
     - name: Fail with explanation
       ansible.builtin.fail:
         msg: |-
-          Bootstrap did not complete within 100 minutes.
+          Bootstrap did not complete within 150 minutes.
           Check the diagnostics above. Common causes:
             - DNS misconfiguration (*.apps wildcard not resolving)
             - Registry unreachable from cluster nodes
             - Insufficient resources (memory/CPU)
             - DHCP not assigning expected IPs
 
-# ── Clean up bootstrap VM ────────────────────────────────────
-- name: Stop bootstrap VM
+# ── Clean up bootstrap VM (UPI only) ───────────────────────────
+- name: "[UPI] Stop bootstrap VM"
+  when: not _cluster_is_sno
   community.proxmox.proxmox_kvm:
     api_host: "{{ proxmox_api_host }}"
     api_user: "{{ proxmox_api_user }}"
@@ -93,32 +128,36 @@
     force: true
   failed_when: false
 
-- name: Delete bootstrap VM with disk purge
+- name: "[UPI] Delete bootstrap VM with disk purge"
+  when: not _cluster_is_sno
   ansible.builtin.command:
     cmd: "qm destroy {{ bootstrap_vmid }} --purge --skiplock"
   delegate_to: proxmox_host
   changed_when: true
   failed_when: false
 
-- name: Delete bootstrap ISO from Proxmox
+- name: "[UPI] Delete bootstrap ISO from Proxmox"
+  when: not _cluster_is_sno
   ansible.builtin.file:
     path: "{{ iso_storage_path }}/{{ cluster_name }}-bootstrap.iso"
     state: absent
   delegate_to: proxmox_host
 
-- name: Bootstrap VM removed
+- name: "[UPI] Bootstrap VM removed"
+  when: not _cluster_is_sno
   ansible.builtin.debug:
     msg: "Bootstrap VM deleted. Cluster is now self-sustaining on {{ master_count }} master(s)."
 
-# ── Mark cluster as installed in infra VM ─────────────────────
-# Sets installing: false → HAProxy removes bootstrap from API and MCS backends
-- name: Mark cluster as installed in infra VM
+# ── Mark cluster as installed in infra VM (UPI only — BIP has no bootstrap) ──
+- name: "[UPI] Mark cluster as installed in infra VM"
+  when: not _cluster_is_sno
   ansible.builtin.include_role:
     name: infra
     tasks_from: mark_installed
 
-# ── Approve CSRs and wait for nodes ───────────────────────────
-- name: Approve CSRs and wait for all nodes (up to 10 min)
+# ── Approve CSRs and wait for nodes (UPI only) ─────────────────
+- name: "[UPI] Approve CSRs and wait for all nodes (up to 10 min)"
+  when: not _cluster_is_sno
   ansible.builtin.shell:
     cmd: |
       set -o pipefail
@@ -136,24 +175,14 @@
   delay: 30
   until: "_cluster_csr_result.stdout is search('READY_COUNT=' ~ ((master_count | int + worker_count | int) | string))"
 
-- name: Display current nodes
-  ansible.builtin.command:
-    cmd: >-
-      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
-      get nodes -o wide
-  register: _cluster_nodes
-  changed_when: false
-
-- name: Current node status
-  ansible.builtin.debug:
-    msg: "{{ _cluster_nodes.stdout_lines }}"
-
-# ── Wait for install-complete with live progress ──────────────
-- name: Initialize install tracking
+# ── Wait for install-complete (UPI) ───────────────────────────
+- name: "[UPI] Initialize install tracking"
+  when: not _cluster_is_sno
   ansible.builtin.set_fact:
     cluster_install_complete: false
 
-- name: Monitor install completion (up to 40 min)
+- name: "[UPI] Monitor install completion (up to 40 min)"
+  when: not _cluster_is_sno
   ansible.builtin.include_tasks: monitor_install_tick.yml
   loop: "{{ range(8) | list }}"
   loop_control:
@@ -161,27 +190,8 @@
     label: "tick {{ _tick }}"
   when: not cluster_install_complete
 
-- name: Install timed out — show operator status
-  when: not cluster_install_complete
-  block:
-    - name: Get operator status
-      ansible.builtin.command:
-        cmd: >-
-          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig get co
-      register: cluster_co_final
-      changed_when: false
-      failed_when: false
-
-    - name: Show status
-      ansible.builtin.debug:
-        msg: "{{ cluster_co_final.stdout }}"
-
-    - name: Fail
-      ansible.builtin.fail:
-        msg: "Not all cluster operators available after 30 minutes."
-
-# ── Final CSR approval ───────────────────────────────────────
-- name: Final CSR approval
+- name: "[UPI] Final CSR approval"
+  when: not _cluster_is_sno
   ansible.builtin.shell:
     cmd: |
       set -o pipefail
@@ -194,7 +204,7 @@
   changed_when: false
   failed_when: false
 
-# ── Verify cluster ───────────────────────────────────────────
+# ── Verify cluster (both SNO and UPI) ─────────────────────────
 - name: Get cluster nodes
   ansible.builtin.command:
     cmd: >-
@@ -212,22 +222,13 @@
 
 - name: Installation complete
   ansible.builtin.debug:
-    msg: |-
-      ====================================
-      OpenShift Cluster Installation Complete!
-      ====================================
-
-      Cluster: {{ cluster_name }}.{{ cluster_base_domain }}
-      Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
-      API: https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443
-
-      Credentials:
-        Username: kubeadmin
-        Password: {{ lookup('file', cluster_dir + '/auth/kubeadmin-password') }}
-
-      Access cluster:
-        export KUBECONFIG={{ playbook_dir }}/../kubeconfig
-        ./oc get nodes
-
-      HAProxy stats: http://{{ infra_ip }}:9000/stats
-      ====================================
+    msg:
+      - "===================================================="
+      - "OpenShift Cluster Installation Complete!"
+      - "===================================================="
+      - "Cluster:  {{ cluster_name }}.{{ cluster_base_domain }}"
+      - "Mode:     {{ 'SNO Bootstrap-In-Place' if _cluster_is_sno else 'UPI (bootstrap VM)' }}"
+      - "Console:  https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}"
+      - "API:      https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443"
+      - "HAProxy stats: http://{{ infra_ip }}:9000/stats"
+      - "===================================================="

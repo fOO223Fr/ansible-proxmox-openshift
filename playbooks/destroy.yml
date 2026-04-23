@@ -36,9 +36,13 @@
     - name: Build VM list from clusters.json
       ansible.builtin.set_fact:
         _destroy_vmids: >-
-          {{ ([_destroy_cluster_info.bootstrap_vmid] if _destroy_cluster_info.bootstrap_vmid is defined else [])
-             + (_destroy_cluster_info.master_vmids | default([]))
-             + (_destroy_cluster_info.worker_vmids | default([])) }}
+          {{ (([_destroy_cluster_info.bootstrap_vmid]
+               if (_destroy_cluster_info.get('install_mode','upi') == 'upi' and
+                   _destroy_cluster_info.bootstrap_vmid is defined and
+                   _destroy_cluster_info.bootstrap_vmid | int > 0)
+               else []) +
+              (_destroy_cluster_info.master_vmids | default([])) +
+              (_destroy_cluster_info.worker_vmids | default([]))) }}
       when: _destroy_cluster_info | length > 0
 
     - name: Set empty VM list if cluster not registered

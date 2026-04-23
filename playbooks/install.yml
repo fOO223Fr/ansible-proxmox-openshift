@@ -23,6 +23,15 @@
           - "Run 'make infra' first to create and configure it."
       when: _install_infra_check.proxmox_vms | default([]) | length == 0
 
+    # ── Set install mode ──────────────────────────────────────────────
+    - name: Set install mode (SNO=Bootstrap-In-Place, multi-node=UPI)
+      ansible.builtin.set_fact:
+        _cluster_is_sno: "{{ master_count | int == 1 and worker_count | int == 0 }}"
+
+    - name: Show install mode
+      ansible.builtin.debug:
+        msg: "Install mode: {{ 'SNO Bootstrap-In-Place (no bootstrap VM)' if _cluster_is_sno else 'UPI with bootstrap VM (' + master_count | string + ' masters, ' + worker_count | string + ' workers)' }}"
+
     # ── Register cluster with infra VM ───────────────────────────────
     # Allocates IPs, MACs, VMIDs, CIDRs — exposes them as Ansible facts
     - name: Register cluster and allocate resources

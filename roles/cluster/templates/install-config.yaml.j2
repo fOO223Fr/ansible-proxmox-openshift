@@ -19,6 +19,13 @@ networking:
   networkType: OVNKubernetes
 platform:
   none: {}
+{% if master_count | int == 1 and worker_count | int == 0 %}
+# Bootstrap-In-Place: SNO installs directly to disk — no separate bootstrap VM needed.
+# The single node boots the RHCOS live ISO, runs bootstrap in-place, writes to disk,
+# and reboots as a fully running cluster. Requires installationDisk to be set.
+bootstrapInPlace:
+  installationDisk: {{ coreos_install_device }}
+{% endif %}
 pullSecret: '{{ ocp_pull_secret }}'
 sshKey: |
   {{ ocp_ssh_pubkey }}

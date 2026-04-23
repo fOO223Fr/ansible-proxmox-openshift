@@ -34,6 +34,8 @@
       machine_cidr: "{{ cluster_machine_cidr }}"
       pod_cidr: "{{ cluster_network_cidr }}"
       service_cidr: "{{ service_network_cidr }}"
+      install_mode: "{{ 'bip' if (_cluster_is_sno | default(false) | bool) else 'upi' }}"
+      # Bootstrap fields only populated for UPI (empty/0 for BIP/SNO)
       bootstrap_vmid: "{{ bootstrap_vmid | int }}"
       bootstrap_ip: "{{ bootstrap_ip }}"
       bootstrap_mac: "{{ bootstrap_mac }}"

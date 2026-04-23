@@ -1,7 +1,27 @@
 ---
+# For SNO (master_count=1, worker_count=0): Bootstrap-In-Place (BIP)
+#   - openshift-install create single-node-ignition-config
+#   - produces: bootstrap-in-place-for-live-iso.ign (merged bootstrap+master)
+#   - no separate bootstrap.ign / master.ign needed
+#
+# For multi-node (master_count>1 or worker_count>0): standard UPI
+#   - openshift-install create ignition-configs
+#   - produces: bootstrap.ign, master.ign, worker.ign separately
+
+- name: Set install mode (SNO=BIP, multi-node=UPI)
+  ansible.builtin.set_fact:
+    _cluster_is_sno: "{{ master_count | int == 1 and worker_count | int == 0 }}"
+
+- name: Set ignition check path based on install mode
+  ansible.builtin.set_fact:
+    _cluster_ignition_check_path: >-
+      {{ (cluster_dir + '/bootstrap-in-place-for-live-iso.ign')
+         if _cluster_is_sno
+         else (cluster_dir + '/bootstrap.ign') }}
+
 - name: Check if ignition configs already exist
   ansible.builtin.stat:
-    path: "{{ cluster_dir }}/bootstrap.ign"
+    path: "{{ _cluster_ignition_check_path }}"
   register: _cluster_ignition_check
 
 - name: Generate ignition configs
@@ -50,42 +70,38 @@
         mode: '0600'
         remote_src: true
 
-    - name: Generate ignition configs
+    - name: "[SNO/BIP] Generate single-node ignition config"
+      when: _cluster_is_sno
+      ansible.builtin.command:
+        cmd: "{{ openshift_install_bin }} create single-node-ignition-config --dir={{ cluster_dir }}"
+      changed_when: true
+
+    - name: "[UPI] Generate ignition configs (bootstrap + master + worker)"
+      when: not _cluster_is_sno
       ansible.builtin.command:
         cmd: "{{ openshift_install_bin }} create ignition-configs --dir={{ cluster_dir }}"
       changed_when: true
 
-- name: Verify ignition files exist
+- name: "[SNO/BIP] Verify BIP ignition file exists"
+  when: _cluster_is_sno
   ansible.builtin.stat:
     path: "{{ cluster_dir }}/{{ item }}"
-  register: _cluster_ign_files
+  register: _cluster_ign_files_sno
+  loop:
+    - bootstrap-in-place-for-live-iso.ign
+    - auth/kubeconfig
+    - auth/kubeadmin-password
+  failed_when: not _cluster_ign_files_sno.stat.exists
+
+- name: "[UPI] Verify UPI ignition files exist"
+  when: not _cluster_is_sno
+  ansible.builtin.stat:
+    path: "{{ cluster_dir }}/{{ item }}"
+  register: _cluster_ign_files_upi
   loop:
     - bootstrap.ign
     - master.ign
     - worker.ign
     - auth/kubeconfig
     - auth/kubeadmin-password
-  failed_when: not _cluster_ign_files.stat.exists
-
-- name: Copy kubeconfig to project root
-  ansible.builtin.copy:
-    src: "{{ cluster_dir }}/auth/kubeconfig"
-    dest: "{{ playbook_dir }}/../kubeconfig"
-    mode: '0600'
-    remote_src: true
-
-- name: Copy oc binary to project root
-  ansible.builtin.copy:
-    src: "{{ oc_bin }}"
-    dest: "{{ playbook_dir }}/../oc"
-    mode: '0755'
-    remote_src: true
-
-- name: Save credentials
-  ansible.builtin.copy:
-    content: |
-      Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}
-      Username: kubeadmin
-      Password: {{ lookup('file', cluster_dir + '/auth/kubeadmin-password') }}
-    dest: "{{ playbook_dir }}/../cluster-credentials.txt"
-    mode: '0600'
+  failed_when: not _cluster_ign_files_upi.stat.exists
