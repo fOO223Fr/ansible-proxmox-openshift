@@ -51,6 +51,30 @@
       delay: 30
       until: _sno_install_complete.rc == 0
 
+    # SNO: the master node must serve as both control-plane AND worker.
+    # Without the worker role and without the master NoSchedule taint removed,
+    # ingress pods cannot schedule → authentication/console never come up.
+    # The official SNO install (Assisted Installer) handles this automatically;
+    # our BIP flow must do it explicitly as a post-install step.
+    - name: "[SNO/BIP] Add worker role to master node"
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          label node {{ cluster_name }}-master-0
+          node-role.kubernetes.io/worker=
+          --overwrite
+      changed_when: true
+      failed_when: false
+
+    - name: "[SNO/BIP] Remove master NoSchedule taint (master IS the worker in SNO)"
+      ansible.builtin.command:
+        cmd: >-
+          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+          adm taint node {{ cluster_name }}-master-0
+          node-role.kubernetes.io/master:NoSchedule-
+      changed_when: true
+      failed_when: false
+
     - name: "[SNO/BIP] Installation complete"
       ansible.builtin.debug:
         msg:

@@ -36,7 +36,7 @@ frontend api
 {% for cluster_name, cluster in clusters.items() %}
 backend api_{{ cluster_name }}
     mode tcp
-{% if cluster.installing %}
+{% if cluster.installing and cluster.bootstrap_ip %}
     server {{ cluster_name }}-bootstrap {{ cluster.bootstrap_ip }}:6443 check
 {% endif %}
 {% for i in range(cluster.master_ips | length) %}
@@ -95,13 +95,13 @@ frontend mcs
     tcp-request inspect-delay 5s
     tcp-request content accept if { req_ssl_hello_type 1 }
 {% for cluster_name, cluster in clusters.items() %}
-{% if cluster.installing %}
+{% if cluster.installing and cluster.bootstrap_ip %}
     use_backend mcs_{{ cluster_name }} if { req_ssl_sni -m end .{{ cluster.domain }} }
 {% endif %}
 {% endfor %}
 
 {% for cluster_name, cluster in clusters.items() %}
-{% if cluster.installing %}
+{% if cluster.installing and cluster.bootstrap_ip %}
 backend mcs_{{ cluster_name }}
     mode tcp
     server {{ cluster_name }}-bootstrap {{ cluster.bootstrap_ip }}:22623 check
