@@ -98,7 +98,13 @@
       changed_when: true
       retries: 3
       delay: 30
-      until: _cache_mirror_result.rc | default(-1) == 0
+      # rc=0 is success; rc=1 from oc adm can mean warnings but mirroring still succeeded.
+      # Check the tag actually landed in the registry as the authoritative success signal.
+      until: >-
+        _cache_mirror_result.rc | default(-1) == 0 or
+        (lookup('url', 'https://' + infra_ip + ':5000/v2/openshift/release-images/tags/list',
+                validate_certs=false) | from_json).get('tags', []) |
+        select('equalto', ocp_version + '-x86_64') | list | length > 0
 
     - name: Show mirror result (last 10 lines)
       ansible.builtin.debug:
