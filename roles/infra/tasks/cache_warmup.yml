@@ -98,7 +98,7 @@
       changed_when: true
       retries: 3
       delay: 30
-      until: _cache_mirror_result.rc == 0
+      until: _cache_mirror_result.rc | default(-1) == 0
 
     - name: Show mirror result (last 10 lines)
       ansible.builtin.debug:
