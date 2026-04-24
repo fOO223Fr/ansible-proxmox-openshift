@@ -12,7 +12,7 @@ help: ## Display this help
 ##@ Infrastructure (one-time per Proxmox host)
 .PHONY: infra
 infra: ## Create or update the shared infra VM (HAProxy, dnsmasq, registry, NAT)
-	$(ANSIBLE_PLAYBOOK) -e @./proxmox.yml playbooks/infra.yml
+	$(RUN) playbooks/infra.yml
 
 .PHONY: cache
 cache: ## Mirror OCP release images into infra VM registry (run once per OCP version)

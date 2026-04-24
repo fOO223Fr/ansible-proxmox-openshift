@@ -210,4 +210,4 @@
       - "  Cache redhat  (port 5002):   https://{{ infra_ip }}:5002"
       - "  Cache docker  (port 5003):   https://{{ infra_ip }}:5003"
       - "  Cache k8s     (port 5004):   https://{{ infra_ip }}:5004"
-      - "Run 'make cache' to mirror OCP {{ ocp_version }} images"
+      - "Run 'make cache' to mirror OCP {{ ocp_version }} images (set ocp_version in overrides.yml)"
