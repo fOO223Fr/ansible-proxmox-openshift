@@ -80,8 +80,9 @@
   when: _cache_needs_mirror
   block:
     # oc adm release mirror streams directly from quay.io to the local registry
-    # in one step — avoids the chunked-upload timeout issues of oc-mirror.
-    - name: Mirror OCP {{ ocp_version }} release images via oc adm
+    # in one step. Runs synchronously (no async) — Ansible waits for completion.
+    # The SSH connection is kept alive via ServerAliveInterval in add_to_inventory.yml.
+    - name: Mirror OCP {{ ocp_version }} release images via oc adm (this may take 30-60 min)
       ansible.builtin.command:
         cmd: >-
           /usr/local/bin/oc adm release mirror
@@ -93,22 +94,35 @@
       delegate_to: infra_host
       become: true
       register: _cache_mirror_result
-      async: 7200
-      poll: 60
+      timeout: 7200
       changed_when: true
-      retries: 3
-      delay: 30
-      # rc=0 is success; rc=1 from oc adm can mean warnings but mirroring still succeeded.
-      # Check the tag actually landed in the registry as the authoritative success signal.
-      until: >-
-        _cache_mirror_result.rc | default(-1) == 0 or
-        (lookup('url', 'https://' + infra_ip + ':5000/v2/openshift/release-images/tags/list',
-                validate_certs=false) | from_json).get('tags', []) |
-        select('equalto', ocp_version + '-x86_64') | list | length > 0
+      failed_when: false
 
     - name: Show mirror result (last 10 lines)
       ansible.builtin.debug:
-        msg: "{{ _cache_mirror_result.stdout_lines[-10:] }}"
+        msg: "{{ _cache_mirror_result.stdout_lines[-10:] | default(['mirror completed']) }}"
+      when: _cache_mirror_result.stdout_lines is defined
+
+    # The real success check: did the tag land in the registry?
+    # oc adm can exit rc=1 with warnings even when mirroring succeeded.
+    - name: Verify release tag exists in registry after mirroring
+      ansible.builtin.uri:
+        url: "https://{{ infra_ip }}:5000/v2/openshift/release-images/tags/list"
+        validate_certs: false
+        return_content: true
+      register: _cache_verify_tags
+      retries: 3
+      delay: 10
+      until: _cache_verify_tags.status == 200
+
+    - name: Fail if release tag was not mirrored
+      ansible.builtin.assert:
+        that: "ocp_version + '-x86_64' in (_cache_verify_tags.json.tags | default([]))"
+        fail_msg: >-
+          OCP {{ ocp_version }} release images were NOT found in the registry
+          after mirroring. Check the mirror output above for errors.
+          rc={{ _cache_mirror_result.rc | default('unknown') }}
+        success_msg: "OCP {{ ocp_version }}-x86_64 confirmed in registry"
 
 - name: OCP {{ ocp_version }} already mirrored
   when: not _cache_needs_mirror
