@@ -1,11 +1,16 @@
 ---
-# Discover or create the isolated cluster bridge before anything else.
-# This sets the cluster_bridge fact used by both VM creation and configuration.
-- name: Discover or create isolated cluster bridge on Proxmox
-  ansible.builtin.include_tasks: ensure_cluster_bridge.yml
-
+# Order matters:
+# 1. create_vm.yml — creates the infra VM if absent AND adds infra_host to inventory.
+#    Also reads the persisted cluster_bridge from the VM if it already exists.
+# 2. ensure_cluster_bridge.yml — now infra_host IS in inventory (VM exists or was just created),
+#    so Step 1 (read /etc/infra/cluster_bridge) can succeed. If the VM was just created,
+#    it falls through to Step 2 (discover/create the bridge on Proxmox).
+# 3. configure.yml — configures services now that both VM and bridge are ready.
 - name: Create infra VM if absent
   ansible.builtin.include_tasks: create_vm.yml
+
+- name: Discover or create isolated cluster bridge on Proxmox
+  ansible.builtin.include_tasks: ensure_cluster_bridge.yml
 
 - name: Configure infra VM services
   ansible.builtin.include_tasks: configure.yml

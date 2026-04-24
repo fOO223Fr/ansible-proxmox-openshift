@@ -11,17 +11,22 @@
 # The chosen bridge name is set as the Ansible fact: cluster_bridge
 
 # ── Step 1: Check if infra VM already recorded the bridge name ───────
+# NOTE: infra_host may not be in inventory yet (fresh setup, VM not created).
+# We use ignore_unreachable so a missing VM doesn't abort here — Step 2 handles it.
 - name: Check if cluster_bridge was previously persisted on infra VM
   ansible.builtin.slurp:
     src: /etc/infra/cluster_bridge
   delegate_to: infra_host
   register: _bridge_persisted
   failed_when: false
+  ignore_errors: true
+  ignore_unreachable: true
 
 - name: Use persisted cluster_bridge name
   ansible.builtin.set_fact:
     cluster_bridge: "{{ _bridge_persisted.content | b64decode | trim }}"
   when:
+    - _bridge_persisted is not skipped
     - _bridge_persisted.content is defined
     - (_bridge_persisted.content | b64decode | trim) | length > 0
 
