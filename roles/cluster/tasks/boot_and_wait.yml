@@ -25,62 +25,86 @@
 # The single node boots the live ISO, installs RHCOS to disk,
 # reboots, and comes up as a fully running cluster.
 # No separate bootstrap VM. No BOOTSTRAP_SAFE check.
-# We monitor directly with openshift-install wait-for install-complete.
+# We poll CVO + operator status every 5 min with live progress output.
 # ══════════════════════════════════════════════════════════════
-- name: "[SNO/BIP] Wait for install to complete (up to 90 min)"
+- name: "[SNO/BIP] Wait for API to become available"
   when: _cluster_is_sno
+  ansible.builtin.wait_for:
+    host: "api.{{ cluster_name }}.{{ cluster_base_domain }}"
+    port: 6443
+    timeout: 1800
+    delay: 60
+
+- name: "[SNO/BIP] Initialize install tracking"
+  when: _cluster_is_sno
+  ansible.builtin.set_fact:
+    _sno_install_complete: false
+
+- name: "[SNO/BIP] Monitor install progress (up to 90 min)"
+  ansible.builtin.include_tasks: monitor_sno_tick.yml
+  loop: "{{ range(18) | list }}"
+  loop_control:
+    loop_var: _tick
+    label: "tick {{ _tick }}"
+  when: _cluster_is_sno and not _sno_install_complete
+
+- name: "[SNO/BIP] Install timed out"
+  when:
+    - _cluster_is_sno
+    - not _sno_install_complete
   block:
-    - name: "[SNO/BIP] Wait for API to become available"
-      ansible.builtin.wait_for:
-        host: "api.{{ cluster_name }}.{{ cluster_base_domain }}"
-        port: 6443
-        timeout: 1800
-        delay: 60
-
-    - name: "[SNO/BIP] Wait for install-complete"
-      ansible.builtin.command:
-        cmd: >-
-          {{ openshift_install_bin }} wait-for install-complete
-          --dir={{ cluster_dir }}
-          --log-level=info
-      register: _sno_install_complete
-      async: 5400
-      poll: 60
-      changed_when: true
-      retries: 2
-      delay: 30
-      until: _sno_install_complete.rc == 0
-
-    # SNO: the master node must serve as both control-plane AND worker.
-    # Without the worker role and without the master NoSchedule taint removed,
-    # ingress pods cannot schedule → authentication/console never come up.
-    # The official SNO install (Assisted Installer) handles this automatically;
-    # our BIP flow must do it explicitly as a post-install step.
-    - name: "[SNO/BIP] Add worker role to master node"
-      ansible.builtin.command:
-        cmd: >-
-          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
-          label node {{ cluster_name }}-master-0
-          node-role.kubernetes.io/worker=
-          --overwrite
-      changed_when: true
+    - name: Collect diagnostic info  # noqa: risky-shell-pipe
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+          echo "=== NODES ==="
+          {{ oc_bin }} get nodes -o wide 2>&1 || echo "(API unreachable)"
+          echo ""
+          echo "=== CLUSTER OPERATORS ==="
+          {{ oc_bin }} get co 2>&1 || echo "(API unreachable)"
+          echo ""
+          echo "=== CVO STATUS ==="
+          {{ oc_bin }} get clusterversion version 2>&1 || echo "(unavailable)"
+        executable: /bin/bash
+      register: _sno_diag
+      changed_when: false
       failed_when: false
 
-    - name: "[SNO/BIP] Remove master NoSchedule taint (master IS the worker in SNO)"
-      ansible.builtin.command:
-        cmd: >-
-          {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
-          adm taint node {{ cluster_name }}-master-0
-          node-role.kubernetes.io/master:NoSchedule-
-      changed_when: true
-      failed_when: false
-
-    - name: "[SNO/BIP] Installation complete"
+    - name: Show diagnostics
       ansible.builtin.debug:
-        msg:
-          - "SNO Bootstrap-In-Place installation complete"
-          - "API: https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443"
-          - "Console: https://console-openshift-console.apps.{{ cluster_name }}.{{ cluster_base_domain }}"
+        msg: "{{ _sno_diag.stdout_lines }}"
+
+    - name: Fail with explanation
+      ansible.builtin.fail:
+        msg: |-
+          SNO install did not complete within 90 minutes.
+          Check the diagnostics above. Common causes:
+            - SignatureValidationFailed (mirror missing sigstore signatures)
+            - DNS misconfiguration (*.apps wildcard not resolving)
+            - Registry unreachable from cluster node
+            - Insufficient resources (memory/CPU)
+
+- name: "[SNO/BIP] Add worker role to master node"
+  when: _cluster_is_sno
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+      label node {{ cluster_name }}-master-0
+      node-role.kubernetes.io/worker=
+      --overwrite
+  changed_when: true
+  failed_when: false
+
+- name: "[SNO/BIP] Remove master NoSchedule taint (master IS the worker in SNO)"
+  when: _cluster_is_sno
+  ansible.builtin.command:
+    cmd: >-
+      {{ oc_bin }} --kubeconfig={{ cluster_dir }}/auth/kubeconfig
+      adm taint node {{ cluster_name }}-master-0
+      node-role.kubernetes.io/master:NoSchedule-
+  changed_when: true
+  failed_when: false
 
 # ══════════════════════════════════════════════════════════════
 # UPI (multi-node) bootstrap monitoring — polls every 30s with live progress

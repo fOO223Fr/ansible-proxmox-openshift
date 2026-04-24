@@ -6,7 +6,7 @@
       export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
       OC={{ oc_bin }}
       NOW=$(date +%H:%M)
-      ELAPSED=$(( (_tick + 1) * 5 ))
+      ELAPSED=$(( ({{ _tick }} + 1) * 5 ))
 
       # Approve any pending CSRs (workers need this to join)
       PENDING=$($OC get csr -o go-template='{% raw %}{{range .items}}{{if not .status}}{{.metadata.name}} {{end}}{{end}}{% endraw %}' 2>/dev/null || echo "")
@@ -90,107 +90,6 @@
 - name: "{{ cluster_boot_tick.stdout_lines[0] | default('Checking...') }}"
   ansible.builtin.debug:
     msg: "{{ cluster_boot_tick.stdout }}"
-
-# OCP 4.21 openshift-apiserver revision fix — runs inside the same bash context
-# as the monitoring script so DNS is already resolved (same subprocess, warm cache).
-# Idempotent: exits immediately if already fixed.
-- name: Apply openshift-apiserver revision fix (OCP 4.21 audit-0 workaround)
-  ansible.builtin.shell:
-    cmd: |
-      set -o pipefail
-      export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
-      OC={{ oc_bin }}
-
-      # Only proceed if the API is reachable (same check as monitoring tick)
-      if ! $OC get namespace openshift-apiserver &>/dev/null; then
-        exit 0
-      fi
-
-      # Check if audit-0 already exists (fix already applied)
-      if $OC get configmap audit-0 -n openshift-apiserver &>/dev/null; then
-        exit 0
-      fi
-
-      # audit-0 is missing — create it from audit-1
-      if ! $OC get configmap audit-1 -n openshift-apiserver &>/dev/null; then
-        exit 0  # audit-1 not ready yet, will retry next tick
-      fi
-
-      echo "[fix] Creating audit-0 configmap (OCP 4.21 openshift-apiserver revision fix)"
-      $OC get configmap audit-1 -n openshift-apiserver -o json | \
-        python3 -c "
-      import json,sys
-      d=json.load(sys.stdin)
-      d['metadata']['name'] = 'audit-0'
-      for k in ['resourceVersion','uid','creationTimestamp','managedFields','generation','annotations']:
-          d['metadata'].pop(k, None)
-      print(json.dumps(d))
-      " | $OC apply -f - && echo "[fix] audit-0 created"
-
-      # Clear the error reason in revision-status-1
-      REASON=$($OC get configmap revision-status-1 -n openshift-apiserver \
-        -o jsonpath='{.data.reason}' 2>/dev/null || echo "")
-      if [ -n "$REASON" ]; then
-        $OC patch configmap revision-status-1 -n openshift-apiserver \
-          --type=merge -p '{"data":{"reason":""}}' && \
-          echo "[fix] revision-status-1 reason cleared"
-      fi
-
-      # Step 2: Force bootstrap complete if master is ready but bootstrap is stuck.
-      # bootkube on the bootstrap VM sometimes waits for CVO progress that is itself
-      # blocked by the same operators. If the master node is Ready and etcd is healthy,
-      # it is safe to manually signal bootstrap completion.
-      #
-      # NOTE: We use grep on the full CO output instead of jsonpath filter
-      # [?(@.type=="Available")] because that filter is unreliable across oc versions
-      # and returns empty silently — causing this condition to never trigger.
-      MASTER_READY=$($OC get nodes --no-headers 2>/dev/null | grep -c " Ready" || echo 0)
-      ETCD_CO=$($OC get co etcd -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' \
-        2>/dev/null || echo "")
-      BOOT_CM_EXISTS=$($OC get cm bootstrap -n kube-system &>/dev/null && echo yes || echo no)
-      if [ "$MASTER_READY" -ge 1 ] && echo "$ETCD_CO" | grep -q "Available=True" && \
-         [ "$BOOT_CM_EXISTS" = "no" ]; then
-        echo "[fix] Master ready and etcd healthy but bootstrap configmap missing."
-        echo "[fix] Creating bootstrap configmap to unblock authentication operator."
-        $OC create configmap bootstrap -n kube-system --from-literal=status=complete 2>/dev/null && \
-          echo "[fix] bootstrap configmap created — bootstrap VM will be removed next tick"
-      fi
-
-      # Step 3: Break the CVO/ConnectivityCheckController deadlock by manually
-      # creating the core OpenShift APIServices. Without these, the Routes API
-      # is absent → authentication/monitoring/console stuck → CVO stays Partial
-      # → ConnectivityCheckController waits forever → circular dependency.
-      # The operator will replace these with managed versions once it unblocks.
-      echo "[fix] Creating core OpenShift APIServices to break CVO deadlock"
-      # Use JSON (not YAML heredoc) to avoid Ansible YAML parser conflicts
-      _create_apiservice() {
-        local group="$1" svc_name="$2" svc_ns="$3"
-        if ! $OC get apiservice "v1.${group}" &>/dev/null; then
-          printf '{"apiVersion":"apiregistration.k8s.io/v1","kind":"APIService","metadata":{"name":"v1.%s","annotations":{"service.alpha.openshift.io/inject-cabundle":"true"}},"spec":{"group":"%s","version":"v1","service":{"name":"%s","namespace":"%s","port":443},"groupPriorityMinimum":2000,"versionPriority":10,"insecureSkipTLSVerify":false}}' \
-            "${group}" "${group}" "${svc_name}" "${svc_ns}" | \
-            $OC apply -f - 2>/dev/null && echo "[fix] APIService created: v1.${group}"
-        fi
-      }
-      for group in apps.openshift.io authorization.openshift.io build.openshift.io \
-                   image.openshift.io project.openshift.io quota.openshift.io \
-                   route.openshift.io security.openshift.io template.openshift.io \
-                   user.openshift.io; do
-        _create_apiservice "${group}" "api" "openshift-apiserver"
-      done
-      # oauth.openshift.io is served by oauth-openshift, not openshift-apiserver
-      _create_apiservice "oauth.openshift.io" "oauth-openshift" "openshift-authentication"
-    executable: /bin/bash
-  register: _fix_result
-  changed_when: "'fix]' in _fix_result.stdout"
-  failed_when: false
-  when: "'API: waiting' not in cluster_boot_tick.stdout"
-
-- name: Show fix output if applied
-  ansible.builtin.debug:
-    msg: "{{ _fix_result.stdout_lines }}"
-  when:
-    - "'API: waiting' not in cluster_boot_tick.stdout"
-    - _fix_result.stdout | length > 0
 
 - name: Set bootstrap completion flag
   ansible.builtin.set_fact:

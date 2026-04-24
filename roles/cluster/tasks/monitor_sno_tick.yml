@@ -1,0 +1,85 @@
+---
+- name: Check SNO install progress
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      export KUBECONFIG={{ cluster_dir }}/auth/kubeconfig
+      OC={{ oc_bin }}
+      NOW=$(date +%H:%M)
+      ELAPSED=$(( ({{ _tick }} + 1) * 5 ))
+
+      API_VER=$(curl -sk --max-time 5 \
+        https://api.{{ cluster_name }}.{{ cluster_base_domain }}:6443/version 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('gitVersion',''))" \
+        2>/dev/null || echo "")
+
+      if [ -z "$API_VER" ]; then
+        echo "[$NOW ${ELAPSED}m] API: waiting... | Node: - | Operators: - | CVO: bootstrapping"
+        echo "INSTALL_COMPLETE=false"
+        exit 0
+      fi
+
+      NODE_RAW=$($OC get nodes --no-headers 2>/dev/null | head -1)
+      NODE_STATUS=$(echo "$NODE_RAW" | awk '{print $2}')
+
+      CVO_MSG=$($OC get clusterversion version \
+        -o jsonpath='{.status.conditions[?(@.type=="Progressing")].message}' 2>/dev/null || echo "")
+      CVO_PCT=$(echo "$CVO_MSG" | grep -oE '[0-9]+ of [0-9]+ done \([0-9]+%' || echo "")
+      CVO_AVAIL=$($OC get clusterversion version \
+        -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
+
+      SKIP="insights"
+      CO_TOTAL=$($OC get co --no-headers 2>/dev/null | grep -v "^${SKIP} " | wc -l || echo 0)
+      AVAIL_TMPL='{% raw %}{{range .items}}{{if ne .metadata.name "insights"}}'
+      AVAIL_TMPL+='{{range .status.conditions}}'
+      AVAIL_TMPL+='{{if eq .type "Available"}}{{if eq .status "True"}}+{{end}}'
+      AVAIL_TMPL+='{{end}}{{end}}{{end}}{{end}}{% endraw %}'
+      CO_AVAIL_COUNT=$($OC get co -o go-template="$AVAIL_TMPL" 2>/dev/null \
+        | grep -o '+' | wc -l || echo 0)
+
+      WAIT_TMPL='{% raw %}{{range .items}}{{$n := .metadata.name}}'
+      WAIT_TMPL+='{{if ne $n "insights"}}{{range .status.conditions}}'
+      WAIT_TMPL+='{{if eq .type "Available"}}'
+      WAIT_TMPL+='{{if ne .status "True"}}{{$n}} {{end}}'
+      WAIT_TMPL+='{{end}}{{end}}{{end}}{{end}}{% endraw %}'
+      CO_WAITING=$($OC get co -o go-template="$WAIT_TMPL" 2>/dev/null || echo "")
+
+      if [ -n "$CVO_PCT" ]; then
+        CVO_ST="$CVO_PCT)"
+      elif [ "$CVO_AVAIL" = "True" ]; then
+        CVO_ST="complete"
+      elif echo "$CVO_MSG" | grep -qi "MultipleErrors\|not available"; then
+        CVO_ST="progressing"
+      else
+        CVO_ST=$(echo "$CVO_MSG" | sed 's/Unable to apply [^:]*: //;s/Error while reconciling [^:]*: //' | cut -c1-50)
+        [ -z "$CVO_ST" ] && CVO_ST="initializing"
+      fi
+
+      MSG="[$NOW ${ELAPSED}m] API: $API_VER | Node: ${NODE_STATUS:-pending}"
+      MSG+=" | Operators: ${CO_AVAIL_COUNT}/${CO_TOTAL} | CVO: $CVO_ST"
+      echo "$MSG"
+      if [ -n "$CO_WAITING" ] && [ "$CO_TOTAL" -gt 0 ]; then
+        echo "  Waiting for: $CO_WAITING"
+      fi
+
+      if [ "$CVO_AVAIL" = "True" ]; then
+        echo "INSTALL_COMPLETE=true"
+      else
+        echo "INSTALL_COMPLETE=false"
+      fi
+    executable: /bin/bash
+  register: _sno_tick
+  changed_when: false
+
+- name: "{{ _sno_tick.stdout_lines[0] | default('Checking...') }}"
+  ansible.builtin.debug:
+    msg: "{{ _sno_tick.stdout }}"
+
+- name: Set install completion flag
+  ansible.builtin.set_fact:
+    _sno_install_complete: "{{ 'INSTALL_COMPLETE=true' in _sno_tick.stdout }}"
+
+- name: Wait before next check
+  ansible.builtin.pause:
+    seconds: 300
+  when: not _sno_install_complete

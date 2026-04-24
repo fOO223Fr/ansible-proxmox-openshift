@@ -50,9 +50,12 @@ ansible-proxmox-openshift/
 │   ├── add-disk.yml         # Hot-add data disk to masters
 │   └── validate.yml         # Pre-flight checks
 │
+├── scripts/
+│   └── status.sh           # Live cluster status dashboard (operator counts, CVO %)
+│
 └── roles/
     ├── infra/               # Infra VM: HAProxy, dnsmasq, NAT, registry, lifecycle
-    ├── cluster/             # Cluster VM creation, ISO building, bootstrap monitoring
+    ├── cluster/             # Cluster VM creation, ISO building, install monitoring
     ├── config/              # Post-install day-2 configuration
     ├── post-install-storage/ # local-path-provisioner, KubeletConfig
     └── validate/            # Pre-flight checks
@@ -90,11 +93,23 @@ All VMIDs, IPs, MACs, pod CIDRs, and service CIDRs are allocated automatically
 from the infra VM at install time. The only per-cluster config needed is sizing
 and a name.
 
-### OCP 4.21+ Workaround
-OCP 4.21.0 has a bug in `openshift-apiserver-operator` where `audit-0` configmap
-is not created on fresh installs, causing a circular deadlock. The bootstrap
-monitoring loop (`monitor_bootstrap_tick.yml`) automatically applies the workaround.
-See `roles/cluster/tasks/fix_openshift_apiserver_revision.yml` for details.
+### Mirror Registry Sigstore Signatures
+RHCOS 9.6 enforces sigstore signature verification for `quay.io/openshift-release-dev/ocp-release`.
+The `cache_warmup.yml` mirrors both the release images **and** the `.sig` sigstore artifact
+to the local registry so that CRI-O can verify signatures without reaching quay.io.
+See [this blog post](https://bastide.org/2026/02/03/openshift-4-21-0-clusterimagepolicy-feature-enforces-signature-verification/)
+for background on the OCP 4.21 ClusterImagePolicy enforcement.
+
+### SNO Install Monitoring
+SNO installs use a live monitoring loop (`monitor_sno_tick.yml`) that polls every 5 minutes
+and displays: API version, node status, operator availability counts, CVO progress
+percentage, and which operators are still waiting. This replaces the previous opaque
+`async/poll` approach that only showed "ASYNC POLL started=True finished=False".
+
+### scripts/status.sh
+A standalone bash script that shows a dashboard of all clusters in `tmp/`:
+operator counts, CVO progress, node status, and Proxmox VM status.
+Run it directly: `./scripts/status.sh` or `./scripts/status.sh hub dr1`.
 
 ---
 

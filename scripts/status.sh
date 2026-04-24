@@ -75,9 +75,16 @@ for cluster in "${CLUSTERS[@]}"; do
     CVO_LINE=$(run_oc get clusterversion version --no-headers 2>/dev/null | head -1)
     CVO_AVAIL=$(echo "$CVO_LINE" | awk '{print $3}')   # True/False
     CVO_PROG=$(echo "$CVO_LINE" | awk '{print $4}')    # True/False
-    CVO_STATUS=$(run_oc get clusterversion version \
-        -o jsonpath='{.status.conditions[?(@.type=="Progressing")].message}' 2>/dev/null \
-        | grep -oE '[0-9]+ of [0-9]+ done \([0-9]+%' | head -1)
+    CVO_MSG=$(run_oc get clusterversion version \
+        -o jsonpath='{.status.conditions[?(@.type=="Progressing")].message}' 2>/dev/null || true)
+    CVO_STATUS=$(echo "$CVO_MSG" | grep -oE '[0-9]+ of [0-9]+ done \([0-9]+%' | head -1 || true)
+    if [ -z "$CVO_STATUS" ] && [ -n "$CVO_MSG" ]; then
+        if echo "$CVO_MSG" | grep -qiE "MultipleErrors|not available"; then
+            CVO_STATUS="progressing"
+        else
+            CVO_STATUS=$(echo "$CVO_MSG" | sed 's/Unable to apply [^:]*: //;s/Error while reconciling [^:]*: //' | cut -c1-40)
+        fi
+    fi
 
     CO_TOTAL=$(run_oc get co --no-headers 2>/dev/null | wc -l | tr -d ' ')
     CO_OK=$(run_oc get co --no-headers 2>/dev/null | grep -c 'True.*False.*False' 2>/dev/null || echo 0)
@@ -85,7 +92,7 @@ for cluster in "${CLUSTERS[@]}"; do
         | grep -v 'True.*False.*False' \
         | grep -v '^$' \
         | awk '{print $1}' \
-        | tr '\n' ',' | sed 's/,$//')
+        | tr '\n' ',' | sed 's/,$//' || true)
 
     # Colour node status
     if [ "$NODE_STATUS" = "Ready" ]; then

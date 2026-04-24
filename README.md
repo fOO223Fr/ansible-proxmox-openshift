@@ -108,7 +108,7 @@ make infra
 #    address=/local.lab/<infra_ip>    (Pi-hole / dnsmasq format)
 #    or: server=/local.lab/<infra_ip> (conditional forwarding format)
 
-# 6. Mirror OCP images (one-time per OCP version, slow first time)
+# 6. Mirror OCP images + sigstore signatures (one-time per OCP version, slow first time)
 cp overrides.yml.example overrides.yml
 # Set ocp_version in overrides.yml
 make cache
@@ -303,6 +303,7 @@ Cluster Operations:
   make status                 Show VM status
   make console                Print console URL + credentials
   make approve-csrs           Approve pending worker node CSRs
+  scripts/status.sh           Live dashboard: all clusters, operators, CVO %
 
 Templates (fast restore):
   make template               Save cluster as Proxmox templates
@@ -362,10 +363,11 @@ make install
   │
   ├── Create VMs: [SNO] master only | [UPI] bootstrap + masters + workers
   │
-  ├── [SNO/BIP] openshift-install wait-for install-complete (up to 90 min)
+  ├── [SNO/BIP] Monitor CVO + operator progress with live output (up to 90 min)
+  │            Shows: API version, node status, operator counts, CVO %, waiting list
   │            Node reboots automatically after writing RHCOS to disk
-  │   [UPI]    Monitor bootstrap (up to 150 min)
-  │            Auto-applies OCP 4.21+ audit-0 + APIService + bootstrap fixes
+  │   [UPI]    Monitor bootstrap with live output (up to 150 min)
+  │            Shows: masters ready, etcd health, operator counts, bootstrap status
   │            Delete bootstrap VM after handoff
   │
   ├── Post-install day-2 config
@@ -390,34 +392,25 @@ The infra VM is a permanent Rocky Linux 9 VM that runs:
 
 ## Known Issues
 
-### OCP 4.21.0: openshift-apiserver PreconditionNotReady
+### RHCOS 9.6: Sigstore signature verification with mirror registries
 
-**Symptom:** Install stalls with `authentication`, `console`, `monitoring`,
-`openshift-apiserver` operators not becoming available. HAProxy shows ingress
-backends cycling up/down.
+**Symptom:** CVO pod stuck in `ImagePullBackOff` with `SignatureValidationFailed`.
 
-**Root cause:** The `openshift-apiserver-operator` fails to create the `audit-0`
-configmap on fresh installs (no previous revision exists), leaving
-`revision-status-1` with a non-empty `reason` field. The `ConnectivityCheckController`
-interprets this as an incomplete version transition and blocks indefinitely, creating
-a circular dependency with the CVO.
+**Root cause:** RHCOS 9.6 enforces sigstore signature verification for
+`quay.io/openshift-release-dev/ocp-release` in `/etc/containers/policy.json`.
+`oc adm release mirror` copies images but not the `.sig` sigstore artifact,
+so CRI-O cannot verify the signature and rejects the pull.
 
-**This project automatically works around it** in `monitor_bootstrap_tick.yml`:
-(Note: SNO installs use Bootstrap-In-Place which has fewer kube-apiserver
-revision rollovers, reducing the window for this race condition to occur.)
-- Creates `audit-0` from `audit-1` once the cluster API is reachable
-- Clears the `revision-status-1.reason` field
-- Creates missing OpenShift APIServices to break the CVO deadlock
-- Forces bootstrap completion if the master is ready but `bootkube` is stuck
-
-No manual intervention needed on subsequent installs.
+**This project handles it automatically** in `cache_warmup.yml` by mirroring
+both the release images and the `.sig` sigstore signature artifact to the
+local registry, so CRI-O can verify signatures without reaching quay.io.
 
 ---
 
 ## Requirements
 
 - Proxmox VE 7.x or 8.x
-- OpenShift 4.19–4.21 (tested on 4.21.0 SNO)
+- OpenShift 4.19–4.21 (tested on 4.21.10 SNO and multi-node)
 - Rocky Linux 9 (for infra VM, downloaded automatically)
 - Python 3.9+ on Ansible controller
 - Ansible 2.15+

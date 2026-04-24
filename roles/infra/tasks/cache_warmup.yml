@@ -129,6 +129,57 @@
   ansible.builtin.debug:
     msg: "OCP {{ ocp_version }} release images already present — skipping mirror"
 
+# ── Mirror sigstore signature (required by RHCOS 9.6 policy.json) ────
+# oc adm release mirror copies images but not the .sig sigstore artifact.
+# Without this, CRI-O rejects pulls with SignatureValidationFailed.
+- name: Get release image digest for sigstore signature mirroring
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      /usr/local/bin/oc image info --registry-config=/tmp/pull-secret.json \
+        "quay.io/openshift-release-dev/ocp-release:{{ ocp_version }}-x86_64" \
+        -o json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['digest'])"
+    executable: /bin/bash
+  delegate_to: infra_host
+  become: true
+  register: _cache_release_digest
+  changed_when: false
+
+- name: Check if sigstore signature is already mirrored
+  ansible.builtin.uri:
+    url: "https://{{ infra_ip }}:5000/v2/openshift/release-images/tags/list"
+    validate_certs: false
+    return_content: true
+  register: _cache_sig_check
+
+- name: Mirror sigstore signature artifact to local registry
+  when: >-
+    (_cache_release_digest.stdout | trim | replace(':', '-')) + '.sig'
+    not in (_cache_sig_check.json.tags | default([]) | join(' '))
+  ansible.builtin.command:
+    cmd: >-
+      /usr/local/bin/oc image mirror
+      --registry-config=/tmp/pull-secret.json
+      --insecure=true
+      quay.io/openshift-release-dev/ocp-release:{{ _sig_tag }}.sig
+      {{ infra_ip }}:5000/openshift/release-images:{{ _sig_tag }}.sig
+  vars:
+    _sig_tag: "{{ _cache_release_digest.stdout | trim | replace(':', '-') }}"
+  delegate_to: infra_host
+  become: true
+  changed_when: true
+  failed_when: false
+  register: _cache_sig_result
+
+- name: Show signature mirror result
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Sigstore signature mirrored successfully'
+         if (_cache_sig_result is changed and _cache_sig_result.rc | default(1) == 0)
+         else ('Sigstore signature already present — skipping'
+               if _cache_sig_result is skipped
+               else 'Signature mirror failed (non-fatal): ' + (_cache_sig_result.stderr | default('unknown'))) }}
+
 # ── Warm pull-through caches with common non-release images ──────────
 - name: Warm registry.redhat.io cache with common operator images
   ansible.builtin.command:
